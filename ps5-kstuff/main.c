@@ -359,6 +359,256 @@ void build_uelf_cr3(uint64_t uelf_cr3, void* uelf_base[2], uint64_t uelf_virt_ba
         copyin(pml3_dmap+8*i, &(uint64_t[1]){(i<<30) | 135}, 8);
 }
 
+/* kernel .text dump to USB */
+
+static uint64_t walk_pte(uint64_t vaddr, uint64_t dmap, uint64_t cr3)
+{
+    uint64_t pml = cr3;
+    for(int shift = 39; shift >= 12; shift -= 9)
+    {
+        uint64_t entry;
+        copyout(&entry, dmap + pml + (((vaddr >> shift) & 0x1ff) << 3), 8);
+        if(!(entry & 1))
+            return 0;
+        if((entry & 0x80) || shift == 12)
+            return entry;
+        pml = entry & ((1ull << 52) - (1ull << 12));
+    }
+    return 0;
+}
+
+static int find_ktext_bounds(uint64_t* text_start, uint64_t* text_end,
+                             uint64_t dmap, uint64_t cr3)
+{
+    *text_end = kdata_base;
+
+    // use the most negative known code offsets as .text landmarks
+    uint64_t candidates[] = {
+        offsets.cpu_switch,
+        offsets.doreti_iret,
+        offsets.copyin,
+        offsets.copyout,
+        offsets.push_pop_all_iret,
+        offsets.malloc,
+        offsets.justreturn,
+        offsets.sceSblServiceMailbox,
+        offsets.eventhandler_register,
+    };
+    uint64_t landmark = kdata_base;
+    for(int i = 0; i < (int)(sizeof(candidates)/sizeof(candidates[0])); i++)
+        if(candidates[i] && candidates[i] < landmark
+           && candidates[i] > 0xffffffff00000000ull)
+            landmark = candidates[i];
+
+    if(landmark == kdata_base)
+        return -1;
+
+    landmark &= ~0xFFFull;
+
+    if(!walk_pte(landmark, dmap, cr3))
+        return -1;
+
+    // coarse scan backward in 2MB steps
+    uint64_t step = 0x200000;
+    uint64_t addr = landmark;
+    uint64_t unmapped = 0;
+    while(kdata_base - addr < 0x2000000) // 32MB limit
+    {
+        addr -= step;
+        if(!walk_pte(addr, dmap, cr3))
+        {
+            unmapped = addr;
+            break;
+        }
+    }
+
+    if(!unmapped)
+    {
+        *text_start = kdata_base - 0x2000000;
+        return 0;
+    }
+
+    // binary search to 4KB precision
+    uint64_t lo = unmapped;
+    uint64_t hi = unmapped + step;
+    while(hi - lo > 0x1000)
+    {
+        uint64_t mid = ((lo + hi) / 2) & ~0xFFFull;
+        if(walk_pte(mid, dmap, cr3))
+            hi = mid;
+        else
+            lo = mid + 0x1000;
+    }
+
+    *text_start = hi;
+    return 0;
+}
+
+static void append_str(char** pp, const char* s)
+{
+    char* p = *pp;
+    while(*s)
+        *p++ = *s++;
+    *pp = p;
+}
+
+static void fmt_hex64(char** pp, uint64_t v)
+{
+    char* p = *pp;
+    *p++ = '0';
+    *p++ = 'x';
+    for(int i = 60; i >= 0; i -= 4)
+        *p++ = "0123456789abcdef"[(v >> i) & 0xf];
+    *pp = p;
+}
+
+static void fmt_dec(char** pp, uint64_t v)
+{
+    char* p = *pp;
+    if(!v) { *p++ = '0'; *pp = p; return; }
+    char tmp[20];
+    int n = 0;
+    while(v) { tmp[n++] = '0' + (v % 10); v /= 10; }
+    for(int i = n - 1; i >= 0; i--)
+        *p++ = tmp[i];
+    *pp = p;
+}
+
+static void dump_ktext_to_usb(void)
+{
+    // check for trigger file on any USB drive
+    char trigger[32];
+    int usb = -1;
+    for(int i = 0; i < 8; i++)
+    {
+        char* p = trigger;
+        append_str(&p, "/mnt/usb");
+        *p++ = '0' + i;
+        append_str(&p, "/dump_ktext");
+        *p = 0;
+        if(if_exists(trigger))
+        {
+            usb = i;
+            break;
+        }
+    }
+    if(usb < 0)
+        return;
+
+    notify("Dumping kernel .text to USB...");
+
+    // read dmap_base + cr3 from kernel_pmap_store
+    uint64_t ptrs[2];
+    copyout(ptrs, offsets.kernel_pmap_store + 32, sizeof(ptrs));
+    uint64_t dmap = ptrs[0] - ptrs[1];
+    uint64_t cr3 = ptrs[1];
+
+    // find .text boundaries via page table walk
+    uint64_t text_start, text_end;
+    if(find_ktext_bounds(&text_start, &text_end, dmap, cr3))
+    {
+        notify("ktext dump FAILED: boundary detection");
+        return;
+    }
+    uint64_t text_size = text_end - text_start;
+    if(text_size < 0x100000 || text_size > 0x2000000)
+    {
+        notify("ktext dump FAILED: unreasonable size");
+        return;
+    }
+
+    // build usb path prefix
+    char prefix[16];
+    {
+        char* p = prefix;
+        append_str(&p, "/mnt/usb");
+        *p++ = '0' + usb;
+        *p = 0;
+    }
+
+    // dump .text to binary file
+    char path[48];
+    {
+        char* p = path;
+        append_str(&p, prefix);
+        append_str(&p, "/ktext_dump.bin");
+        *p = 0;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(fd < 0)
+    {
+        notify("ktext dump FAILED: cannot create file");
+        return;
+    }
+
+    size_t chunk_sz = 0x10000; // 64KB
+    char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+
+    uint64_t total = 0;
+    int err = 0;
+    while(total < text_size)
+    {
+        size_t to_read = chunk_sz;
+        if(text_size - total < to_read)
+            to_read = text_size - total;
+        ssize_t got = copyout(buf, text_start + total, to_read);
+        if(got <= 0) { err = 1; break; }
+        if(write(fd, buf, got) != got) { err = 2; break; }
+        total += got;
+    }
+    close(fd);
+    munmap(buf, chunk_sz);
+
+    if(err)
+    {
+        notify("ktext dump FAILED: I/O error");
+        return;
+    }
+
+    // write metadata
+    {
+        char* p = path;
+        append_str(&p, prefix);
+        append_str(&p, "/ktext_meta.txt");
+        *p = 0;
+    }
+
+    uint32_t fwver = r0gdb_get_fw_version() >> 16;
+
+    char meta[512];
+    {
+        char* p = meta;
+        append_str(&p, "text_base=");  fmt_hex64(&p, text_start); *p++ = '\n';
+        append_str(&p, "text_end=");   fmt_hex64(&p, text_end);   *p++ = '\n';
+        append_str(&p, "text_size=");  fmt_dec(&p, text_size);    *p++ = '\n';
+        append_str(&p, "kdata_base="); fmt_hex64(&p, kdata_base); *p++ = '\n';
+        append_str(&p, "dmap_base=");  fmt_hex64(&p, dmap);       *p++ = '\n';
+        append_str(&p, "cr3=");        fmt_hex64(&p, cr3);        *p++ = '\n';
+        append_str(&p, "fw_version="); fmt_hex64(&p, fwver);      *p++ = '\n';
+        *p = 0;
+
+        int mfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if(mfd >= 0)
+        {
+            write(mfd, meta, p - meta);
+            close(mfd);
+        }
+    }
+
+    // notify with size
+    {
+        char msg[80];
+        char* p = msg;
+        append_str(&p, "kernel .text dumped: ");
+        fmt_dec(&p, text_size / (1024 * 1024));
+        append_str(&p, " MB to /mnt/usb");
+        *p++ = '0' + usb;
+        *p = 0;
+        notify(msg);
+    }
+}
+
 int find_proc(const char* name)
 {
     for(int pid = 1; pid < 1024; pid++)
@@ -2605,6 +2855,7 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         return 1;
 #endif
     }
+    dump_ktext_to_usb();
 #ifdef PS5KEK
     extern uint64_t p_syscall;
     getpid();
