@@ -118,6 +118,102 @@ def get_kernel(_cache=[]):
         _cache.append(dump_kernel())
     return _cache[0]
 
+def _read_pte(dmap_base, phys_addr):
+    """Read a page table entry from its physical address via the dmap."""
+    return gdb.ieval('{void*}%d' % (dmap_base + phys_addr))
+
+def _is_page_mapped(addr, dmap_base, cr3):
+    """Check if a kernel virtual address is mapped by walking x86-64 page tables."""
+    pml = cr3
+    for shift in (39, 30, 21, 12):
+        idx = (addr >> shift) & 0x1FF
+        entry = _read_pte(dmap_base, pml + idx * 8)
+        if not (entry & 1):
+            return False
+        if (entry & 0x80) or shift == 12:
+            return True
+        pml = entry & ((1 << 52) - (1 << 12))
+    return False
+
+@retry_on_error
+def dump_ktext():
+    """
+    Dump the kernel .text section by scanning backward from kdata_base.
+
+    Uses firmware offsets and page table walking via kernel_pmap_store to
+    find the .text boundaries, then streams the section over a socket.
+    Returns (text_bytes, text_base_address).
+    """
+    gdb.use_r0gdb(R0GDB_FLAGS)
+    kdata_base = gdb.ieval('kdata_base')
+    gdb.eval('offsets.allproc = '+ostr(kdata_base + get_symbol('allproc')))
+    if not gdb.ieval('rpipe'): gdb.eval('r0gdb_init_with_offsets()')
+
+    # Get dmap_base and cr3 from kernel_pmap_store
+    kpms = kdata_base + get_symbol('kernel_pmap_store')
+    dmap_virt = gdb.ieval('{void*}%d' % (kpms + 32))
+    cr3 = gdb.ieval('{void*}%d' % (kpms + 40))
+    dmap_base = dmap_virt - cr3
+
+    # Find the most negative known offset to use as a .text landmark
+    most_negative = 0
+    for k in available_symbols:
+        if k in symbols and isinstance(symbols[k], int) and symbols[k] < most_negative:
+            most_negative = symbols[k]
+    if most_negative == 0:
+        most_negative = -0xA00000  # default ~10MB
+
+    known_code = (kdata_base + most_negative) & ~0xFFF
+
+    # Coarse scan backward (2MB steps) to find approximate boundary
+    step = 0x200000
+    addr = known_code
+    unmapped_addr = None
+    while kdata_base - addr < 0x2000000:  # 32MB limit
+        addr -= step
+        if not _is_page_mapped(addr, dmap_base, cr3):
+            unmapped_addr = addr
+            break
+
+    if unmapped_addr is None:
+        text_start = kdata_base - 0x2000000
+    else:
+        # Binary search for exact boundary (4KB precision)
+        lo, hi = unmapped_addr, unmapped_addr + step
+        while hi - lo > 0x1000:
+            mid = ((lo + hi) // 2) & ~0xFFF
+            if _is_page_mapped(mid, dmap_base, cr3):
+                hi = mid
+            else:
+                lo = mid + 0x1000
+        text_start = hi
+
+    text_size = kdata_base - text_start
+    print('ktext: %s - %s (%d bytes, %.1f MB)' % (
+        hex(text_start), hex(kdata_base), text_size, text_size / (1024*1024)))
+
+    # Dump via copyout + socket (same pattern as dump_kernel)
+    local_buf = bytearray()
+    with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping ktext') as addr:
+        remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
+        remote_buf = gdb.ieval('malloc(1048576)')
+        one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
+        total_sent = 0
+        while total_sent < text_size:
+            chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, text_start+total_sent, min(1048576, text_size - total_sent)))
+            if chk0 <= 0: break
+            assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
+            total_sent += chk0
+        while len(local_buf) != total_sent:
+            gdb.eval('(int)nanosleep(%d)'%one_second)
+        gdb.eval('(int)close(%d)'%remote_fd)
+    return bytes(local_buf), text_start
+
+def get_ktext(_cache=[]):
+    if not _cache:
+        _cache.append(dump_ktext())
+    return _cache[0]
+
 @derive_symbol
 @retry_on_error
 def rootvnode():
