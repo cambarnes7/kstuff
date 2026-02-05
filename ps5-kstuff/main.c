@@ -290,6 +290,28 @@ uint64_t read_pte_raw(uintptr_t addr, uint64_t dmap, uint64_t pml)
     return 0;
 }
 
+// Walk page table for addr, return kernel VA of first not-present entry.
+// Sets *level to shift value (39=PML4, 30=PDPT, 21=PD, 12=PT).
+// Returns 0 if already fully mapped.
+uint64_t find_pte_hole(uintptr_t addr, int* level, uint64_t dmap, uint64_t pml)
+{
+    for(int i = 39; i >= 12; i -= 9)
+    {
+        uint64_t entry_addr = dmap + pml + ((addr & (0x1ffull << i)) >> (i - 3));
+        uint64_t entry;
+        copyout(&entry, entry_addr, 8);
+        if(!(entry & 1))
+        {
+            *level = i;
+            return entry_addr; // kernel VA of the not-present entry
+        }
+        if((entry & 128) || i == 12)
+            return 0; // already mapped (leaf PTE found)
+        pml = entry & ((1ull << 52) - (1ull << 12));
+    }
+    return 0;
+}
+
 uint64_t kernel_get_proc(uint64_t pid)
 {
     uint64_t proc = kread8(offsets.allproc);
@@ -520,7 +542,7 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // === Try read methods (all use pcb_onfault, safe from panic) ===
+    // === Try read methods ===
     uint64_t test_val = 0;
     int read_method = 0; // 0=unknown, 1=dmap-pipe, 2=kfncall-dmap
 
@@ -530,9 +552,135 @@ static void dump_ktext_to_usb(void)
     {
         read_method = 1;
     }
-    else
+    else if(!(dmap_pte & 1))
     {
-        // Method 2: kernel's native copyout from dmap+phys via kfncall
+        // dmap has no mapping for .text physical pages — create one.
+        // Walk the dmap page table to find where the hole is.
+        int hole_level = 0;
+        uint64_t hole_addr = find_pte_hole(dmap + test_phys, &hole_level,
+                                            dmap, cr3);
+
+        if(hole_addr && hole_level <= 21)
+        {
+            // Create a 2MB PDE or 4KB PTE mapping the .text physical page.
+            // .text uses 2MB pages (tp shows PS bit), so phys is 2MB-aligned
+            // at the PD level. Use NX since this is a data-read mapping.
+            uint64_t pte_val;
+            if(hole_level == 21)
+            {
+                // 2MB PDE: phys base (2MB-aligned) | P|RW|A|D|PS|NX
+                pte_val = (test_phys & ~0x1FFFFFull)
+                        | 0x80000000000000E3ull;
+            }
+            else
+            {
+                // 4KB PTE: phys page | P|RW|A|D|NX
+                pte_val = (test_phys & ~0xFFFull)
+                        | 0x8000000000000063ull;
+            }
+
+            copyin(hole_addr, &pte_val, 8);
+
+            // flush TLB by reloading CR3
+            r0gdb_write_cr3(r0gdb_read_cr3());
+
+            // diagnostic: show what we wrote
+            {
+                char msg[120];
+                char* p = msg;
+                append_str(&p, "ktext: pte_write l=");
+                fmt_dec(&p, hole_level);
+                append_str(&p, " a=");
+                fmt_hex64(&p, hole_addr);
+                append_str(&p, " v=");
+                fmt_hex64(&p, pte_val);
+                *p = 0;
+                notify(msg);
+            }
+
+            // test the new mapping via kfncall+copyout (pcb_onfault = safe)
+            uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
+                (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
+
+            {
+                char msg[80];
+                char* p = msg;
+                append_str(&p, "ktext: pte_test ret=");
+                fmt_dec(&p, kcpy_ret);
+                if(kcpy_ret == 0)
+                {
+                    append_str(&p, " val=");
+                    fmt_hex64(&p, test_val);
+                }
+                *p = 0;
+                notify(msg);
+            }
+
+            if(kcpy_ret == 0)
+                read_method = 2;
+        }
+        else if(hole_addr && hole_level > 21)
+        {
+            // Hole is at PDPT or PML4 level — need to allocate page table pages.
+            // Allocate a zeroed page for the next level down.
+            uint64_t new_pt = r0gdb_kmalloc(0x1000);
+            if(new_pt)
+            {
+                // Zero it (kmalloc may not zero)
+                char zeros[64];
+                for(int z = 0; z < 64; z++) zeros[z] = 0;
+                for(int off = 0; off < 0x1000; off += 64)
+                    copyin(new_pt + off, zeros, 64);
+
+                // Get physical address of the new page table page
+                uint64_t new_pt_phys = virt2phys(new_pt, 0, dmap, cr3);
+                if(new_pt_phys != (uint64_t)-1)
+                {
+                    // Write intermediate entry: phys | P|RW|U|A
+                    uint64_t inter_val = (new_pt_phys & ~0xFFFull) | 0x67ull;
+                    copyin(hole_addr, &inter_val, 8);
+
+                    // Now find the next hole (should be at a lower level)
+                    int hole2_level = 0;
+                    uint64_t hole2_addr = find_pte_hole(dmap + test_phys,
+                                                         &hole2_level, dmap, cr3);
+                    if(hole2_addr && hole2_level <= 21)
+                    {
+                        uint64_t pte_val;
+                        if(hole2_level == 21)
+                            pte_val = (test_phys & ~0x1FFFFFull)
+                                    | 0x80000000000000E3ull;
+                        else
+                            pte_val = (test_phys & ~0xFFFull)
+                                    | 0x8000000000000063ull;
+                        copyin(hole2_addr, &pte_val, 8);
+                    }
+                }
+
+                r0gdb_write_cr3(r0gdb_read_cr3());
+
+                uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
+                    (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
+
+                {
+                    char msg[80];
+                    char* p = msg;
+                    append_str(&p, "ktext: pte_alloc ret=");
+                    fmt_dec(&p, kcpy_ret);
+                    *p = 0;
+                    notify(msg);
+                }
+
+                if(kcpy_ret == 0)
+                    read_method = 2;
+            }
+        }
+    }
+
+    // If still no method, try kfncall from dmap+phys directly (may work if
+    // PTE creation succeeded for a different reason)
+    if(!read_method)
+    {
         uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
             (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
         if(kcpy_ret == 0)
@@ -541,11 +689,7 @@ static void dump_ktext_to_usb(void)
 
     if(!read_method)
     {
-        // Both dmap reads failed. Report whether it's NPT or missing mapping.
-        if(dmap_pte & 1)
-            notify("ktext dump FAILED: dmap PTE present but read blocked (NPT?)");
-        else
-            notify("ktext dump FAILED: dmap PTE not present (no mapping)");
+        notify("ktext dump FAILED: all read methods blocked");
         return;
     }
 
@@ -595,6 +739,29 @@ static void dump_ktext_to_usb(void)
 
         if(read_method == 2)
         {
+            // ensure dmap mapping exists for this physical page
+            uint64_t dmap_check = read_pte_raw(dmap + phys, dmap, cr3);
+            if(!(dmap_check & 1))
+            {
+                // no mapping — create one (same logic as the test)
+                int hl = 0;
+                uint64_t ha = find_pte_hole(dmap + phys, &hl, dmap, cr3);
+                if(ha && hl == 21)
+                {
+                    uint64_t pv = (phys & ~0x1FFFFFull)
+                                | 0x80000000000000E3ull;
+                    copyin(ha, &pv, 8);
+                    r0gdb_write_cr3(r0gdb_read_cr3());
+                }
+                else if(ha && hl == 12)
+                {
+                    uint64_t pv = (phys & ~0xFFFull)
+                                | 0x8000000000000063ull;
+                    copyin(ha, &pv, 8);
+                    r0gdb_write_cr3(r0gdb_read_cr3());
+                }
+            }
+
             // kernel copyout from dmap+phys via r0gdb_kfncall
             uint64_t ret = r0gdb_kfncall(offsets.copyout,
                 (uint64_t)(dmap + phys), (uint64_t)buf, (uint64_t)to_read);
