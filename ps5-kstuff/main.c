@@ -275,6 +275,21 @@ uint64_t virt2phys(uintptr_t addr, uint64_t* phys_limit, uint64_t dmap, uint64_t
     //unreachable
 }
 
+uint64_t read_pte_raw(uintptr_t addr, uint64_t dmap, uint64_t pml)
+{
+    for(int i = 39; i >= 12; i -= 9)
+    {
+        uint64_t entry;
+        copyout(&entry, dmap+pml+((addr & (0x1ffull << i)) >> (i - 3)), 8);
+        if(!(entry & 1))
+            return 0; // not present
+        if((entry & 128) || i == 12)
+            return entry; // leaf PTE with all flags
+        pml = entry & ((1ull << 52) - (1ull << 12));
+    }
+    return 0;
+}
+
 uint64_t kernel_get_proc(uint64_t pid)
 {
     uint64_t proc = kread8(offsets.allproc);
@@ -461,50 +476,76 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // Determine which read method works.
-    // All .text VA reads panic regardless of fault handling.
-    // kmemcpy (rep movsb) from dmap+phys also panics (no pcb_onfault).
-    // Pipe-copyout from dmap+phys returns EFAULT safely (has pcb_onfault).
-    // Kernel's native copyout via r0gdb_kfncall also has pcb_onfault.
-    // Strategy: try pipe-copyout first (fast), then kernel copyout (safe).
-    uint64_t test_val = 0;
-    ssize_t dmap_pipe_test = copyout(&test_val, dmap + test_phys, 8);
-    int read_method = 0; // 0=unknown, 1=dmap-pipe, 2=kfncall-dmap
-    uint64_t kcpy_ret = (uint64_t)-1;
+    // === PTE diagnostics to understand hardware protection ===
 
+    // Test A: verify kfncall+copyout works at all (read from known-good .data)
+    uint64_t baseline_val = 0;
+    uint64_t baseline_ret = r0gdb_kfncall(offsets.copyout,
+        kdata_base, (uint64_t)&baseline_val, (uint64_t)8);
+
+    // Test B: read raw PTE for .text VA (guest page table permissions)
+    uint64_t text_pte = read_pte_raw(landmark, dmap, cr3);
+
+    // Test C: read raw PTE for dmap+phys (does dmap even map these pages?)
+    uint64_t dmap_pte = read_pte_raw(dmap + test_phys, dmap, cr3);
+
+    // diagnostic notification line 1: PTE info
+    {
+        char msg[140];
+        char* p = msg;
+        append_str(&p, "ktext: bl=");
+        fmt_dec(&p, baseline_ret);
+        append_str(&p, " tp=");
+        fmt_hex64(&p, text_pte);
+        append_str(&p, " dp=");
+        fmt_hex64(&p, dmap_pte);
+        *p = 0;
+        notify(msg);
+    }
+    // diagnostic notification line 2: phys + size
+    {
+        char msg[100];
+        char* p = msg;
+        append_str(&p, "ktext: ph=");
+        fmt_hex64(&p, test_phys);
+        append_str(&p, " sz=");
+        fmt_hex64(&p, text_size);
+        *p = 0;
+        notify(msg);
+    }
+
+    if(baseline_ret != 0)
+    {
+        notify("ktext dump FAILED: kfncall+copyout broken");
+        return;
+    }
+
+    // === Try read methods (all use pcb_onfault, safe from panic) ===
+    uint64_t test_val = 0;
+    int read_method = 0; // 0=unknown, 1=dmap-pipe, 2=kfncall-dmap
+
+    // Method 1: pipe-copyout from dmap+phys (fast path)
+    ssize_t dmap_pipe_test = copyout(&test_val, dmap + test_phys, 8);
     if(dmap_pipe_test > 0)
     {
-        read_method = 1; // dmap via pipe works directly
+        read_method = 1;
     }
     else
     {
-        // try kernel's native copyout from dmap+phys via r0gdb_kfncall
-        // kernel copyout has pcb_onfault -- will return EFAULT, not panic
-        kcpy_ret = r0gdb_kfncall(offsets.copyout,
+        // Method 2: kernel's native copyout from dmap+phys via kfncall
+        uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
             (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
         if(kcpy_ret == 0)
             read_method = 2;
     }
 
-    // diagnostic notification
-    {
-        char msg[128];
-        char* p = msg;
-        append_str(&p, "ktext: sz=");
-        fmt_hex64(&p, text_size);
-        append_str(&p, " dp=");
-        fmt_dec(&p, (uint64_t)dmap_pipe_test);
-        append_str(&p, " kc=");
-        fmt_dec(&p, kcpy_ret);
-        append_str(&p, " m=");
-        fmt_dec(&p, read_method);
-        *p = 0;
-        notify(msg);
-    }
-
     if(!read_method)
     {
-        notify("ktext dump FAILED: all read methods blocked");
+        // Both dmap reads failed. Report whether it's NPT or missing mapping.
+        if(dmap_pte & 1)
+            notify("ktext dump FAILED: dmap PTE present but read blocked (NPT?)");
+        else
+            notify("ktext dump FAILED: dmap PTE not present (no mapping)");
         return;
     }
 
