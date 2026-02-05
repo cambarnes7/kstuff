@@ -461,13 +461,25 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // test if we can read .text physical memory through dmap (fast path)
+    // determine which read method works
+    // Tier 1: pipe-copyout from dmap+phys (fast)
+    // Tier 2: kernel's native copyout via r0gdb_kfncall (has pcb_onfault)
     uint64_t test_val;
-    ssize_t test_got = copyout(&test_val, dmap + test_phys, 8);
-    int use_kread8 = (test_got <= 0);
+    ssize_t dmap_test = copyout(&test_val, dmap + test_phys, 8);
+    int read_method = 0; // 0=unknown, 1=dmap, 2=kfncall
 
-    // also test kread8 on the .text virtual address directly
-    uint64_t kread8_test = kread8(landmark);
+    if(dmap_test > 0)
+    {
+        read_method = 1;
+    }
+    else
+    {
+        // dmap read failed; try kernel's native copyout which has pcb_onfault
+        uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
+            (uint64_t)landmark, (uint64_t)&test_val, (uint64_t)8);
+        if(kcpy_ret == 0)
+            read_method = 2;
+    }
 
     // diagnostic notification
     {
@@ -476,21 +488,18 @@ static void dump_ktext_to_usb(void)
         append_str(&p, "ktext: sz=");
         fmt_hex64(&p, text_size);
         append_str(&p, " dmap=");
-        fmt_dec(&p, (uint64_t)test_got);
-        append_str(&p, " kr8=");
-        fmt_hex64(&p, kread8_test);
+        fmt_dec(&p, (uint64_t)dmap_test);
+        append_str(&p, " method=");
+        fmt_dec(&p, read_method);
         *p = 0;
         notify(msg);
     }
 
-    if(use_kread8 && kread8_test == 0)
+    if(!read_method)
     {
         notify("ktext dump FAILED: all read methods blocked");
         return;
     }
-
-    if(use_kread8)
-        notify("Using kread8 (slow, ~10 min)...");
 
     // build usb path prefix
     char prefix[16];
@@ -517,33 +526,28 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    size_t chunk_sz = 0x1000; // 4KB write buffer
+    size_t chunk_sz = 0x1000; // 4KB
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
     uint64_t total = 0;
     int err = 0;
 
-    if(use_kread8)
+    if(read_method == 2)
     {
-        // slow path: kread8 reads 8 bytes at a time via setsockopt/getsockopt
-        size_t buf_pos = 0;
+        // Tier 2: kernel's native copyout via r0gdb_kfncall
+        // The kernel's copyout(kaddr, uaddr, len) has built-in pcb_onfault
         while(total < text_size)
         {
             uint64_t vaddr = text_start + total;
-            uint64_t val = kread8(vaddr);
             uint64_t remaining = text_size - total;
-            size_t to_copy = 8;
-            if(remaining < 8) to_copy = remaining;
-            for(size_t i = 0; i < to_copy; i++)
-                buf[buf_pos++] = ((char*)&val)[i];
-            total += to_copy;
+            size_t to_read = chunk_sz;
+            if(remaining < to_read) to_read = remaining;
 
-            // flush buffer when full or at end
-            if(buf_pos >= chunk_sz || total >= text_size)
-            {
-                if(write(fd, buf, buf_pos) != (ssize_t)buf_pos) { err = 2; break; }
-                buf_pos = 0;
-            }
+            uint64_t ret = r0gdb_kfncall(offsets.copyout,
+                (uint64_t)vaddr, (uint64_t)buf, (uint64_t)to_read);
+            if(ret != 0) { err = 1; break; }
+            if(write(fd, buf, to_read) != (ssize_t)to_read) { err = 2; break; }
+            total += to_read;
 
             // progress notification every 1 MB
             if((total & 0xFFFFF) == 0 && total > 0)
@@ -562,7 +566,7 @@ static void dump_ktext_to_usb(void)
     }
     else
     {
-        // fast path: copyout via dmap physical addresses
+        // Tier 1: pipe-copyout via dmap physical addresses (fast path)
         while(total < text_size)
         {
             uint64_t vaddr = text_start + total;
@@ -2884,7 +2888,6 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         return 1;
 #endif
     }
-    dump_ktext_to_usb();
 #ifdef PS5KEK
     extern uint64_t p_syscall;
     getpid();
@@ -2941,6 +2944,7 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         mem_blocks[i+1] = (mem_blocks[i] ? mem_blocks[i] + (1<<23) : 0);
     }
     gdb_remote_syscall("write", 3, 0, (uintptr_t)1, (uintptr_t)"done\n", (uintptr_t)5);
+    dump_ktext_to_usb();
     uint64_t comparison_table_base = (uint64_t)kmalloc(131072);
     uint64_t comparison_table = ((comparison_table_base - 1) | 65535) + 1;
     uint8_t* comparison_table_data = mmap(0, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
