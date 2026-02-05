@@ -461,9 +461,13 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // test if we can actually read .text physical memory through dmap
+    // test if we can read .text physical memory through dmap (fast path)
     uint64_t test_val;
     ssize_t test_got = copyout(&test_val, dmap + test_phys, 8);
+    int use_kread8 = (test_got <= 0);
+
+    // also test kread8 on the .text virtual address directly
+    uint64_t kread8_test = kread8(landmark);
 
     // diagnostic notification
     {
@@ -471,19 +475,22 @@ static void dump_ktext_to_usb(void)
         char* p = msg;
         append_str(&p, "ktext: sz=");
         fmt_hex64(&p, text_size);
-        append_str(&p, " trd=");
+        append_str(&p, " dmap=");
         fmt_dec(&p, (uint64_t)test_got);
-        append_str(&p, " ph=");
-        fmt_hex64(&p, test_phys);
+        append_str(&p, " kr8=");
+        fmt_hex64(&p, kread8_test);
         *p = 0;
         notify(msg);
     }
 
-    if(test_got <= 0)
+    if(use_kread8 && kread8_test == 0)
     {
-        notify("ktext dump FAILED: dmap read blocked");
+        notify("ktext dump FAILED: all read methods blocked");
         return;
     }
+
+    if(use_kread8)
+        notify("Using kread8 (slow, ~10 min)...");
 
     // build usb path prefix
     char prefix[16];
@@ -510,30 +517,70 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // read .text via dmap (physical) to bypass execute-only virtual mapping
-    size_t chunk_sz = 0x1000; // 4KB -- largest proven copyout size in codebase
+    size_t chunk_sz = 0x1000; // 4KB write buffer
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
     uint64_t total = 0;
     int err = 0;
-    while(total < text_size)
+
+    if(use_kread8)
     {
-        uint64_t vaddr = text_start + total;
-        uint64_t phys_limit;
-        uint64_t phys = virt2phys(vaddr, &phys_limit, dmap, cr3);
-        if(phys == (uint64_t)-1) { err = 3; break; }
+        // slow path: kread8 reads 8 bytes at a time via setsockopt/getsockopt
+        size_t buf_pos = 0;
+        while(total < text_size)
+        {
+            uint64_t vaddr = text_start + total;
+            uint64_t val = kread8(vaddr);
+            uint64_t remaining = text_size - total;
+            size_t to_copy = 8;
+            if(remaining < 8) to_copy = remaining;
+            for(size_t i = 0; i < to_copy; i++)
+                buf[buf_pos++] = ((char*)&val)[i];
+            total += to_copy;
 
-        // read up to end of this physical page, but max chunk_sz
-        uint64_t page_avail = phys_limit - phys;
-        uint64_t remaining = text_size - total;
-        size_t to_read = chunk_sz;
-        if(page_avail < to_read) to_read = page_avail;
-        if(remaining < to_read) to_read = remaining;
+            // flush buffer when full or at end
+            if(buf_pos >= chunk_sz || total >= text_size)
+            {
+                if(write(fd, buf, buf_pos) != (ssize_t)buf_pos) { err = 2; break; }
+                buf_pos = 0;
+            }
 
-        ssize_t got = copyout(buf, dmap + phys, to_read);
-        if(got <= 0) { err = 1; break; }
-        if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
-        total += to_read;
+            // progress notification every 1 MB
+            if((total & 0xFFFFF) == 0 && total > 0)
+            {
+                char msg[64];
+                char* p = msg;
+                append_str(&p, "ktext dump: ");
+                fmt_dec(&p, total / (1024 * 1024));
+                append_str(&p, "/");
+                fmt_dec(&p, text_size / (1024 * 1024));
+                append_str(&p, " MB");
+                *p = 0;
+                notify(msg);
+            }
+        }
+    }
+    else
+    {
+        // fast path: copyout via dmap physical addresses
+        while(total < text_size)
+        {
+            uint64_t vaddr = text_start + total;
+            uint64_t phys_limit;
+            uint64_t phys = virt2phys(vaddr, &phys_limit, dmap, cr3);
+            if(phys == (uint64_t)-1) { err = 3; break; }
+
+            uint64_t page_avail = phys_limit - phys;
+            uint64_t remaining = text_size - total;
+            size_t to_read = chunk_sz;
+            if(page_avail < to_read) to_read = page_avail;
+            if(remaining < to_read) to_read = remaining;
+
+            ssize_t got = copyout(buf, dmap + phys, to_read);
+            if(got <= 0) { err = 1; break; }
+            if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
+            total += to_read;
+        }
     }
     close(fd);
     munmap(buf, chunk_sz);
