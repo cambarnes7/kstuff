@@ -391,6 +391,68 @@ static void fmt_dec(char** pp, uint64_t v)
     *pp = p;
 }
 
+/* read a single 4KB page from a kernel virtual address, trying every
+   available method in order.  returns number of bytes successfully read
+   (0 = all methods failed). */
+static size_t bruteforce_read_page(char* dst, uint64_t vaddr,
+                                   uint64_t dmap, uint64_t cr3,
+                                   int* method_out)
+{
+    ssize_t got;
+
+    /* method 1: translate to physical via page tables, read through dmap.
+       dmap is the direct-map of all physical memory; because it lives at a
+       different virtual range than .text it may have read permission even
+       when .text virtual mapping is execute-only (XOM). */
+    uint64_t phys = virt2phys(vaddr, 0, dmap, cr3);
+    if(phys != (uint64_t)-1)
+    {
+        got = copyout(dst, dmap + phys, 0x1000);
+        if(got == 0x1000) { if(method_out) *method_out = 1; return 0x1000; }
+    }
+
+    /* method 2: copyout directly from the .text virtual address.
+       on some FW the kernel pages are RX (not XO) and this just works. */
+    got = copyout(dst, vaddr, 0x1000);
+    if(got == 0x1000) { if(method_out) *method_out = 2; return 0x1000; }
+
+    /* method 3: kread8 -- reads 8 bytes at a time through the
+       setsockopt/getsockopt kernel path.  different internal code path
+       than copyout, so it may succeed when copyout does not. */
+    {
+        int any_nonzero = 0;
+        for(size_t off = 0; off < 0x1000; off += 8)
+        {
+            uint64_t val = kread8(vaddr + off);
+            for(size_t i = 0; i < 8; i++)
+                dst[off + i] = ((char*)&val)[i];
+            if(val) any_nonzero = 1;
+        }
+        /* kread8 doesn't signal errors; it silently returns 0 on failure.
+           A page of all zeros is possible but extremely unlikely for .text
+           code.  Accept it if we see any non-zero qword. */
+        if(any_nonzero) { if(method_out) *method_out = 3; return 0x1000; }
+    }
+
+    /* method 4: kread8 from dmap+phys (different virtual address through
+       the socket path) */
+    if(phys != (uint64_t)-1)
+    {
+        int any_nonzero = 0;
+        for(size_t off = 0; off < 0x1000; off += 8)
+        {
+            uint64_t val = kread8(dmap + phys + off);
+            for(size_t i = 0; i < 8; i++)
+                dst[off + i] = ((char*)&val)[i];
+            if(val) any_nonzero = 1;
+        }
+        if(any_nonzero) { if(method_out) *method_out = 4; return 0x1000; }
+    }
+
+    if(method_out) *method_out = 0;
+    return 0;
+}
+
 static void dump_ktext_to_usb(void)
 {
     // check for trigger file on any USB drive
@@ -414,83 +476,120 @@ static void dump_ktext_to_usb(void)
 
     notify("Dumping kernel .text to USB...");
 
-    // compute .text range directly from known offsets
-    // all addresses between the most negative offset and kdata_base are
-    // proven mapped -- kstuff already patches/calls them during init
-    uint64_t candidates[] = {
-        offsets.cpu_switch,
-        offsets.doreti_iret,
-        offsets.copyin,
-        offsets.copyout,
-        offsets.push_pop_all_iret,
-        offsets.malloc,
-        offsets.justreturn,
-        offsets.sceSblServiceMailbox,
-        offsets.eventhandler_register,
-    };
-    uint64_t landmark = kdata_base;
-    for(int i = 0; i < (int)(sizeof(candidates)/sizeof(candidates[0])); i++)
-        if(candidates[i] && candidates[i] < landmark
-           && candidates[i] > (kdata_base - 0x2000000))
-            landmark = candidates[i];
-
-    if(landmark == kdata_base)
+    // use ALL offsets from the offset table as .text landmarks
+    // every non-zero offset that falls below kdata_base points into .text
+    uint64_t* offs = (uint64_t*)&offsets;
+    int n_offs = sizeof(offsets) / sizeof(uint64_t);
+    uint64_t deepest = kdata_base;   // most negative address (start of .text)
+    uint64_t shallowest = 0;         // closest to kdata_base
+    int n_text_offsets = 0;
+    for(int i = 0; i < n_offs; i++)
     {
-        notify("ktext dump FAILED: no .text offsets found");
+        uint64_t a = offs[i];
+        if(!a || a >= kdata_base) continue;
+        // sanity: must be within 32 MB below kdata_base
+        if(kdata_base - a > 0x2000000) continue;
+        n_text_offsets++;
+        if(a < deepest)    deepest = a;
+        if(a > shallowest) shallowest = a;
+    }
+
+    if(!n_text_offsets)
+    {
+        notify("ktext dump FAILED: no .text offsets");
         return;
     }
 
-    // page-align the most negative known offset -- no margin beyond known range
-    uint64_t text_start = landmark & ~0xFFFull;
-    uint64_t text_end = kdata_base;
-    uint64_t text_size = text_end - text_start;
+    {
+        char msg[96];
+        char* p = msg;
+        append_str(&p, "ktext: ");
+        fmt_dec(&p, n_text_offsets);
+        append_str(&p, " offsets, deepest=");
+        fmt_hex64(&p, deepest);
+        *p = 0;
+        notify(msg);
+    }
 
     // get dmap + cr3 for virtual-to-physical translation
-    // kernel .text may be execute-only (XOM) at the virtual address,
-    // so we translate to physical and read through the dmap instead
     uint64_t ptrs[2];
     copyout(ptrs, offsets.kernel_pmap_store + 32, sizeof(ptrs));
     uint64_t dmap = ptrs[0] - ptrs[1];
     uint64_t cr3 = ptrs[1];
 
-    // verify virt2phys works on a known .text address
-    uint64_t test_phys = virt2phys(landmark, 0, dmap, cr3);
-    if(test_phys == (uint64_t)-1)
+    // brute-force scan backward from the deepest known offset to find
+    // unmapped pages, extending the dump range beyond known symbols.
+    // .text likely starts earlier than our deepest offset.
+    uint64_t scan_addr = deepest & ~0xFFFull;
+    uint64_t text_start = scan_addr;
+    int consecutive_unmapped = 0;
+    for(int step = 0; step < 8192; step++) // up to 32 MB backward
     {
-        notify("ktext dump FAILED: virt2phys");
-        return;
+        scan_addr -= 0x1000;
+        uint64_t phys = virt2phys(scan_addr, 0, dmap, cr3);
+        if(phys == (uint64_t)-1)
+        {
+            consecutive_unmapped++;
+            // stop after 4 consecutive unmapped pages -- we've left .text
+            if(consecutive_unmapped >= 4)
+                break;
+        }
+        else
+        {
+            consecutive_unmapped = 0;
+            text_start = scan_addr;
+        }
     }
 
-    // test if we can read .text physical memory through dmap (fast path)
-    uint64_t test_val;
-    ssize_t test_got = copyout(&test_val, dmap + test_phys, 8);
-    int use_kread8 = (test_got <= 0);
+    uint64_t text_end = kdata_base;
+    uint64_t text_size = text_end - text_start;
+    uint64_t n_pages = text_size / 0x1000;
 
-    // also test kread8 on the .text virtual address directly
-    uint64_t kread8_test = kread8(landmark);
-
-    // diagnostic notification
     {
         char msg[128];
         char* p = msg;
-        append_str(&p, "ktext: sz=");
-        fmt_hex64(&p, text_size);
-        append_str(&p, " dmap=");
-        fmt_dec(&p, (uint64_t)test_got);
-        append_str(&p, " kr8=");
-        fmt_hex64(&p, kread8_test);
+        append_str(&p, "ktext range: ");
+        fmt_hex64(&p, text_start);
+        append_str(&p, " - ");
+        fmt_hex64(&p, text_end);
+        append_str(&p, " (");
+        fmt_dec(&p, text_size / (1024 * 1024));
+        append_str(&p, " MB, ");
+        fmt_dec(&p, n_pages);
+        append_str(&p, " pages)");
         *p = 0;
         notify(msg);
     }
 
-    if(use_kread8 && kread8_test == 0)
+    // probe methods on a known .text address to report capabilities
     {
-        notify("ktext dump FAILED: all read methods blocked");
-        return;
-    }
+        uint64_t probe_addr = deepest & ~0xFFFull;
+        uint64_t probe_phys = virt2phys(probe_addr, 0, dmap, cr3);
+        uint64_t test_dmap = 0, test_direct = 0, test_kr8 = 0;
+        if(probe_phys != (uint64_t)-1)
+        {
+            char tmp[8];
+            ssize_t g = copyout(tmp, dmap + probe_phys, 8);
+            test_dmap = (g == 8);
+        }
+        {
+            char tmp[8];
+            ssize_t g = copyout(tmp, probe_addr, 8);
+            test_direct = (g == 8);
+        }
+        test_kr8 = kread8(probe_addr);
 
-    if(use_kread8)
-        notify("Using kread8 (slow, ~10 min)...");
+        char msg[128];
+        char* p = msg;
+        append_str(&p, "probes: dmap=");
+        fmt_dec(&p, test_dmap);
+        append_str(&p, " direct=");
+        fmt_dec(&p, test_direct);
+        append_str(&p, " kr8=");
+        fmt_hex64(&p, test_kr8);
+        *p = 0;
+        notify(msg);
+    }
 
     // build usb path prefix
     char prefix[16];
@@ -501,7 +600,7 @@ static void dump_ktext_to_usb(void)
         *p = 0;
     }
 
-    // dump .text to binary file
+    // open output binary file
     char path[48];
     {
         char* p = path;
@@ -517,83 +616,90 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    size_t chunk_sz = 0x1000; // 4KB write buffer
-    char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+    // allocate page buffer and bitmap for tracking results
+    // bitmap: 1 byte per page (0=failed, 1-4=method that succeeded)
+    char* buf = mmap(0, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+    char* bitmap = mmap(0, n_pages, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
-    uint64_t total = 0;
-    int err = 0;
+    static const char dead_pattern[16] = {
+        0xDE, 0xAD, 0xC0, 0xDE, 0xDE, 0xAD, 0xC0, 0xDE,
+        0xDE, 0xAD, 0xC0, 0xDE, 0xDE, 0xAD, 0xC0, 0xDE
+    };
 
-    if(use_kread8)
+    uint64_t pages_ok = 0;
+    uint64_t pages_fail = 0;
+    uint64_t method_counts[5] = {0}; // [0]=failed, [1-4]=methods
+    int write_err = 0;
+
+    // page-by-page brute-force dump
+    for(uint64_t pg = 0; pg < n_pages; pg++)
     {
-        // slow path: kread8 reads 8 bytes at a time via setsockopt/getsockopt
-        size_t buf_pos = 0;
-        while(total < text_size)
+        uint64_t vaddr = text_start + pg * 0x1000;
+        int method = 0;
+
+        size_t got = bruteforce_read_page(buf, vaddr, dmap, cr3, &method);
+        if(got == 0x1000)
         {
-            uint64_t vaddr = text_start + total;
-            uint64_t val = kread8(vaddr);
-            uint64_t remaining = text_size - total;
-            size_t to_copy = 8;
-            if(remaining < 8) to_copy = remaining;
-            for(size_t i = 0; i < to_copy; i++)
-                buf[buf_pos++] = ((char*)&val)[i];
-            total += to_copy;
-
-            // flush buffer when full or at end
-            if(buf_pos >= chunk_sz || total >= text_size)
-            {
-                if(write(fd, buf, buf_pos) != (ssize_t)buf_pos) { err = 2; break; }
-                buf_pos = 0;
-            }
-
-            // progress notification every 1 MB
-            if((total & 0xFFFFF) == 0 && total > 0)
-            {
-                char msg[64];
-                char* p = msg;
-                append_str(&p, "ktext dump: ");
-                fmt_dec(&p, total / (1024 * 1024));
-                append_str(&p, "/");
-                fmt_dec(&p, text_size / (1024 * 1024));
-                append_str(&p, " MB");
-                *p = 0;
-                notify(msg);
-            }
+            pages_ok++;
+            bitmap[pg] = method;
+            method_counts[method]++;
         }
-    }
-    else
-    {
-        // fast path: copyout via dmap physical addresses
-        while(total < text_size)
+        else
         {
-            uint64_t vaddr = text_start + total;
-            uint64_t phys_limit;
-            uint64_t phys = virt2phys(vaddr, &phys_limit, dmap, cr3);
-            if(phys == (uint64_t)-1) { err = 3; break; }
+            // fill unreadable page with dead pattern so partial dumps
+            // are still loadable and the gaps are obvious
+            for(int i = 0; i < 0x1000; i += 16)
+                for(int j = 0; j < 16; j++)
+                    buf[i + j] = dead_pattern[j];
+            pages_fail++;
+            bitmap[pg] = 0;
+            method_counts[0]++;
+        }
 
-            uint64_t page_avail = phys_limit - phys;
-            uint64_t remaining = text_size - total;
-            size_t to_read = chunk_sz;
-            if(page_avail < to_read) to_read = page_avail;
-            if(remaining < to_read) to_read = remaining;
+        if(write(fd, buf, 0x1000) != 0x1000) { write_err = 1; break; }
 
-            ssize_t got = copyout(buf, dmap + phys, to_read);
-            if(got <= 0) { err = 1; break; }
-            if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
-            total += to_read;
+        // progress notification every 256 pages (~1 MB)
+        if(((pg + 1) & 0xFF) == 0)
+        {
+            char msg[80];
+            char* p = msg;
+            append_str(&p, "ktext: ");
+            fmt_dec(&p, (pg + 1) * 4 / 1024);
+            append_str(&p, "/");
+            fmt_dec(&p, text_size / (1024 * 1024));
+            append_str(&p, " MB (");
+            fmt_dec(&p, pages_ok);
+            append_str(&p, " ok, ");
+            fmt_dec(&p, pages_fail);
+            append_str(&p, " fail)");
+            *p = 0;
+            notify(msg);
         }
     }
     close(fd);
-    munmap(buf, chunk_sz);
 
-    if(err)
+    if(write_err)
     {
-        char msg[64];
-        char* p = msg;
-        append_str(&p, "ktext dump FAILED: I/O err=");
-        fmt_dec(&p, err);
-        *p = 0;
-        notify(msg);
+        notify("ktext dump FAILED: USB write error");
+        munmap(buf, 0x1000);
+        munmap(bitmap, n_pages);
         return;
+    }
+
+    // write bitmap file (1 byte per page: method number or 0 for failed)
+    {
+        char* p = path;
+        append_str(&p, prefix);
+        append_str(&p, "/ktext_bitmap.bin");
+        *p = 0;
+    }
+    {
+        int bfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if(bfd >= 0)
+        {
+            write(bfd, bitmap, n_pages);
+            close(bfd);
+        }
     }
 
     // write metadata
@@ -606,15 +712,39 @@ static void dump_ktext_to_usb(void)
 
     uint32_t fwver = r0gdb_get_fw_version() >> 16;
 
-    char meta[512];
+    char meta[1024];
     {
         char* p = meta;
-        append_str(&p, "text_base=");  fmt_hex64(&p, text_start); *p++ = '\n';
-        append_str(&p, "text_end=");   fmt_hex64(&p, text_end);   *p++ = '\n';
-        append_str(&p, "text_size=");  fmt_dec(&p, text_size);    *p++ = '\n';
-        append_str(&p, "kdata_base="); fmt_hex64(&p, kdata_base); *p++ = '\n';
-        append_str(&p, "dmap_base=");  fmt_hex64(&p, dmap);       *p++ = '\n';
-        append_str(&p, "fw_version="); fmt_hex64(&p, fwver);      *p++ = '\n';
+        append_str(&p, "text_base=");     fmt_hex64(&p, text_start); *p++ = '\n';
+        append_str(&p, "text_end=");      fmt_hex64(&p, text_end);   *p++ = '\n';
+        append_str(&p, "text_size=");     fmt_dec(&p, text_size);    *p++ = '\n';
+        append_str(&p, "kdata_base=");    fmt_hex64(&p, kdata_base); *p++ = '\n';
+        append_str(&p, "dmap_base=");     fmt_hex64(&p, dmap);       *p++ = '\n';
+        append_str(&p, "cr3=");           fmt_hex64(&p, cr3);        *p++ = '\n';
+        append_str(&p, "fw_version=");    fmt_hex64(&p, fwver);      *p++ = '\n';
+        append_str(&p, "total_pages=");   fmt_dec(&p, n_pages);      *p++ = '\n';
+        append_str(&p, "pages_ok=");      fmt_dec(&p, pages_ok);     *p++ = '\n';
+        append_str(&p, "pages_fail=");    fmt_dec(&p, pages_fail);   *p++ = '\n';
+        append_str(&p, "method_dmap=");   fmt_dec(&p, method_counts[1]); *p++ = '\n';
+        append_str(&p, "method_direct="); fmt_dec(&p, method_counts[2]); *p++ = '\n';
+        append_str(&p, "method_kr8=");    fmt_dec(&p, method_counts[3]); *p++ = '\n';
+        append_str(&p, "method_kr8dmap=");fmt_dec(&p, method_counts[4]); *p++ = '\n';
+        // dump all known .text offsets for validation
+        append_str(&p, "\n# known .text offsets (addr, file_offset):\n");
+        for(int i = 0; i < n_offs; i++)
+        {
+            uint64_t a = offs[i];
+            if(!a || a >= kdata_base || kdata_base - a > 0x2000000) continue;
+            append_str(&p, "off_");
+            fmt_dec(&p, i);
+            append_str(&p, "=");
+            fmt_hex64(&p, a);
+            append_str(&p, ",");
+            fmt_hex64(&p, a - text_start);
+            *p++ = '\n';
+            // safety: don't overflow meta buffer
+            if(p - meta > 900) break;
+        }
         *p = 0;
 
         int mfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -625,13 +755,20 @@ static void dump_ktext_to_usb(void)
         }
     }
 
-    // notify with size
+    munmap(buf, 0x1000);
+    munmap(bitmap, n_pages);
+
+    // final summary notification
     {
-        char msg[80];
+        char msg[128];
         char* p = msg;
-        append_str(&p, "kernel .text dumped: ");
-        fmt_dec(&p, text_size / (1024 * 1024));
-        append_str(&p, " MB to /mnt/usb");
+        append_str(&p, "ktext done: ");
+        fmt_dec(&p, pages_ok);
+        append_str(&p, "/");
+        fmt_dec(&p, n_pages);
+        append_str(&p, " pages (");
+        fmt_dec(&p, pages_ok * 100 / (n_pages ? n_pages : 1));
+        append_str(&p, "%) to /mnt/usb");
         *p++ = '0' + usb;
         *p = 0;
         notify(msg);

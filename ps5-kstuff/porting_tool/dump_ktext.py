@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
-PS5 Kernel .text Section Dumper
+PS5 Kernel .text Section Dumper (Brute-Force)
 
 Dumps the kernel's executable .text section for offline analysis using
-firmware-specific offsets. The dump can be loaded into reverse engineering
-tools (Ghidra, IDA Pro, Binary Ninja) for disassembly and analysis.
+firmware-specific offsets.  Employs a page-by-page brute-force strategy
+that tries multiple read methods per page so that a partial dump is
+always produced even when some pages are protected by XOM (execute-only
+memory enforced by the PS5 hypervisor via EPT).
 
-The key insight is that in the PS5 kernel offset tables, negative offsets
-relative to kdata_base point into the .text section. By using these offsets
-as landmarks combined with page table walking via kernel_pmap_store, we can
-determine the exact .text boundaries and dump the section safely.
+Read methods tried per page, in order:
+  1. copyout from DMAP+physical  (page-table walk, then read through
+     the direct physical memory mapping -- bypasses first-level XOM)
+  2. copyout from the .text virtual address directly
+     (works if the page is RX rather than XO)
+  3. kread8 from virtual address  (setsockopt/getsockopt path --
+     different kernel code path from pipe-based copyout)
+  4. kread8 from DMAP+physical
+
+Pages that cannot be read by any method are filled with a 0xDEADC0DE
+pattern so the dump is still loadable and the gaps are obvious.
 
 For FW 4.03, known .text offsets range from:
   -0x9d6f80 (cpu_switch, ~10.3 MB below kdata_base) to
@@ -30,8 +39,9 @@ Required offsets in JSON:
     kernel_pmap_store    - Kernel page map store (for page table walking)
 
 Output:
-    <output_file>          - Raw binary dump of kernel .text
-    <output_file>_meta.json - Metadata (base address, size, fw version)
+    <output_file>              - Raw binary dump of kernel .text
+    <output_file>_bitmap.bin   - 1 byte per page (0=fail, 1-4=method)
+    <output_file>_meta.json    - Metadata (base address, size, stats)
 
     Load the raw binary in Ghidra at the text_base address from the metadata.
 """
@@ -68,12 +78,14 @@ if 'allproc' not in symbols:
 
 if 'kernel_pmap_store' not in symbols:
     print('error: offsets.json must contain "kernel_pmap_store"')
-    print('       (needed for page table walking to find .text boundaries)')
     sys.exit(1)
 
 gdb = gdb_rpc.GDB(ps5_ip, loader_port)
 
 R0GDB_FLAGS = ['-DMEMRW_FALLBACK', '-DNO_BUILTIN_OFFSETS']
+
+DEAD_PATTERN = b'\xDE\xAD\xC0\xDE' * 4  # 16 bytes, tiled to fill page
+PAGE_SIZE = 0x1000
 
 
 def ostr(x):
@@ -82,153 +94,165 @@ def ostr(x):
 
 
 # --- Page Table Walking ---
-#
-# x86-64 uses 4-level page tables:
-#   PML4 (bits 47:39) -> PDPT (bits 38:30) -> PD (bits 29:21) -> PT (bits 20:12)
-#
-# We walk the kernel's page tables through the direct memory map (dmap),
-# which maps all physical memory at a fixed virtual offset. This lets us
-# safely check if a virtual address is mapped without risking a panic from
-# accessing unmapped memory.
-#
-# Page table entry flags:
-#   Bit 0 (P)   - Present
-#   Bit 7 (PS)  - Page Size (2MB huge page at PD level, 1GB at PDPT level)
-#   Bit 63 (NX) - No-Execute (0 = executable, i.e. .text)
 
 def read_pte(dmap_base, phys_addr):
     """Read a page table entry from its physical address via the dmap."""
     return gdb.ieval('{void*}%d' % (dmap_base + phys_addr))
 
 
-def is_page_mapped(addr, dmap_base, cr3):
-    """
-    Check if a kernel virtual address is mapped by walking the page tables.
-
-    Reads page table entries through the dmap (always safe since the page
-    table pages themselves are always mapped). Returns False if any level
-    has a non-present entry.
-    """
-    pml = cr3
-    for shift in (39, 30, 21, 12):
-        idx = (addr >> shift) & 0x1FF
-        entry = read_pte(dmap_base, pml + idx * 8)
-        if not (entry & 1):  # Present bit not set
-            return False
-        if (entry & 0x80) or shift == 12:  # Huge page or final PT level
-            return True
-        pml = entry & ((1 << 52) - (1 << 12))  # Physical addr of next level
-    return False
-
-
-def is_page_executable(addr, dmap_base, cr3):
-    """
-    Check if a kernel virtual address is mapped as executable.
-
-    Walks the page table and checks the NX bit (bit 63) at the final level.
-    Kernel .text pages should have NX=0 (executable), while .data/.bss will
-    have NX=1 (non-executable).
-    """
+def virt2phys(addr, dmap_base, cr3):
+    """Walk x86-64 page tables to translate virtual -> physical.
+    Returns physical address or None if unmapped."""
     pml = cr3
     for shift in (39, 30, 21, 12):
         idx = (addr >> shift) & 0x1FF
         entry = read_pte(dmap_base, pml + idx * 8)
         if not (entry & 1):
-            return False
+            return None
         if (entry & 0x80) or shift == 12:
-            # Check NX bit: 0 means executable
-            return not bool(entry & (1 << 63))
+            mask = (1 << shift) - 1
+            phys_base = entry & ((1 << 52) - (1 << shift))
+            return phys_base | (addr & mask)
         pml = entry & ((1 << 52) - (1 << 12))
-    return False
+    return None
 
+
+def is_page_mapped(addr, dmap_base, cr3):
+    """Check if a kernel virtual address is mapped."""
+    return virt2phys(addr, dmap_base, cr3) is not None
+
+
+# --- Brute-Force Page Reader ---
+
+def try_copyout_page(remote_buf, src_addr, one_sec):
+    """Try to copyout a full page from src_addr via r0gdb.
+    Returns PAGE_SIZE bytes or None."""
+    try:
+        got = gdb.ieval('copyout(%d, %d, %d)' % (remote_buf, src_addr, PAGE_SIZE))
+        if got != PAGE_SIZE:
+            return None
+        # read the remote_buf back to local memory
+        local = bytearray()
+        with gdb_rpc.BlobReceiver(gdb, local, None) as addr:
+            fd = gdb.ieval('r0gdb_open_socket("%s", %d)' % addr)
+            assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)' % (fd, remote_buf, PAGE_SIZE))
+            while len(local) < PAGE_SIZE:
+                gdb.eval('(int)nanosleep(%d)' % one_sec)
+            gdb.eval('(int)close(%d)' % fd)
+        if len(local) >= PAGE_SIZE:
+            return bytes(local[:PAGE_SIZE])
+    except Exception:
+        pass
+    return None
+
+
+def try_kread8_page(addr):
+    """Read a page 8 bytes at a time via kread8.
+    Returns PAGE_SIZE bytes or None (None if all zeros)."""
+    result = bytearray(PAGE_SIZE)
+    any_nonzero = False
+    for off in range(0, PAGE_SIZE, 8):
+        try:
+            val = gdb.ieval('kread8(%d)' % (addr + off))
+        except Exception:
+            val = 0
+        struct.pack_into('<Q', result, off, val)
+        if val:
+            any_nonzero = True
+    return bytes(result) if any_nonzero else None
+
+
+def bruteforce_read_page(vaddr, dmap_base, cr3, remote_buf, one_sec):
+    """Try every method to read a single 4KB page.
+    Returns (data_bytes, method_number) or (None, 0)."""
+
+    phys = virt2phys(vaddr, dmap_base, cr3)
+
+    # Method 1: copyout from DMAP+physical
+    if phys is not None:
+        data = try_copyout_page(remote_buf, dmap_base + phys, one_sec)
+        if data:
+            return data, 1
+
+    # Method 2: copyout from virtual address directly
+    data = try_copyout_page(remote_buf, vaddr, one_sec)
+    if data:
+        return data, 2
+
+    # Method 3: kread8 from virtual address
+    data = try_kread8_page(vaddr)
+    if data:
+        return data, 3
+
+    # Method 4: kread8 from DMAP+physical
+    if phys is not None:
+        data = try_kread8_page(dmap_base + phys)
+        if data:
+            return data, 4
+
+    return None, 0
+
+
+# --- Boundary Scanner ---
 
 def find_text_boundaries(kdata_base, dmap_base, cr3):
-    """
-    Find the kernel .text section boundaries via page table walking.
+    """Find .text boundaries using all negative offsets + backward scanning."""
 
-    Strategy:
-    1. Use the most negative known offset as a guaranteed .text address
-    2. Scan backward from there in 2MB steps until we hit unmapped memory
-    3. Binary search between the last unmapped and first mapped address
-       to find the exact boundary at page (4KB) granularity
-    4. Verify contiguity with spot checks
-
-    Returns (text_start, text_end) or (None, None) on failure.
-    """
-    # Find the most negative offset in our symbols - this is the deepest
-    # known point in the .text section relative to kdata_base
-    most_negative = 0
+    # Collect all negative offsets
+    negative_offsets = {}
     for key, value in symbols.items():
-        if isinstance(value, int) and value < most_negative:
-            most_negative = value
+        if isinstance(value, int) and value < 0:
+            negative_offsets[key] = value
 
-    if most_negative == 0:
-        # No negative offsets found - use a conservative default
-        # Most PS5 kernels have .text extending ~10MB below kdata_base
-        most_negative = -0xA00000
-        print('  warning: no negative offsets in JSON, using default range')
+    if not negative_offsets:
+        print('  warning: no negative offsets in JSON, using -0xA00000 default')
+        negative_offsets['(default)'] = -0xA00000
 
-    # Page-align the known code address (round down)
+    most_negative = min(negative_offsets.values())
+    deepest_sym = [k for k, v in negative_offsets.items() if v == most_negative][0]
+    print('  %d negative offsets found' % len(negative_offsets))
+    print('  deepest: %s = %s' % (deepest_sym, hex(most_negative)))
+
     known_code = (kdata_base + most_negative) & ~0xFFF
-    print('  deepest known .text offset: %s (%s)' % (
-        hex(most_negative),
-        next((k for k, v in symbols.items() if v == most_negative), '?')
-    ))
-    print('  known code address: %s' % hex(known_code))
 
-    # Verify the known address is actually mapped
     if not is_page_mapped(known_code, dmap_base, cr3):
-        print('  ERROR: known code address is not mapped - check offsets')
+        print('  ERROR: deepest known address %s is not mapped' % hex(known_code))
         return None, None
 
-    # Phase 1: Coarse scan backward in 2MB steps
-    print('  phase 1: coarse scan (2MB steps)...')
-    step = 0x200000  # 2MB
-    max_scan = 0x2000000  # 32MB safety limit
+    # Scan backward from deepest known offset to find actual .text start
+    print('  scanning backward from %s...' % hex(known_code))
+    text_start = known_code
+    consecutive_unmapped = 0
     addr = known_code
-    unmapped_addr = None
+    pages_scanned = 0
 
-    while kdata_base - addr < max_scan:
-        addr -= step
-        if not is_page_mapped(addr, dmap_base, cr3):
-            unmapped_addr = addr
-            break
+    while pages_scanned < 8192:  # up to 32 MB
+        addr -= PAGE_SIZE
+        pages_scanned += 1
+        if is_page_mapped(addr, dmap_base, cr3):
+            consecutive_unmapped = 0
+            text_start = addr
+        else:
+            consecutive_unmapped += 1
+            if consecutive_unmapped >= 4:
+                break
 
-    if unmapped_addr is None:
-        # Everything mapped for 32MB - use the scan limit
-        print('  warning: no unmapped boundary found within 32MB, using limit')
-        text_start = kdata_base - max_scan
-    else:
-        # Phase 2: Binary search for exact boundary (4KB precision)
-        print('  phase 2: binary search for exact boundary...')
-        lo = unmapped_addr  # known unmapped
-        hi = unmapped_addr + step  # known mapped
+        # progress
+        if pages_scanned % 512 == 0:
+            sys.stdout.write('\r  scanned %d pages backward...' % pages_scanned)
+            sys.stdout.flush()
 
-        while hi - lo > 0x1000:
-            mid = ((lo + hi) // 2) & ~0xFFF
-            if is_page_mapped(mid, dmap_base, cr3):
-                hi = mid
-            else:
-                lo = mid + 0x1000
-
-        text_start = hi
+    if pages_scanned >= 512:
+        print()
 
     text_end = kdata_base
+    text_size = text_end - text_start
+    n_pages = text_size // PAGE_SIZE
 
-    # Phase 3: Spot-check contiguity
-    print('  phase 3: verifying contiguity...')
-    check_addrs = [
-        text_start,
-        text_start + 0x1000,
-        (text_start + known_code) // 2,
-        known_code,
-        kdata_base - 0x1000,
-    ]
-    for cp in check_addrs:
-        cp = cp & ~0xFFF
-        if text_start <= cp < text_end:
-            if not is_page_mapped(cp, dmap_base, cr3):
-                print('  WARNING: gap at %s - .text may not be contiguous' % hex(cp))
+    print('  scanned %d pages backward' % pages_scanned)
+    print('  .text range: %s - %s (%d bytes, %.1f MB, %d pages)' % (
+        hex(text_start), hex(text_end), text_size,
+        text_size / (1024 * 1024), n_pages))
 
     return text_start, text_end
 
@@ -236,17 +260,9 @@ def find_text_boundaries(kdata_base, dmap_base, cr3):
 # --- Main Dump Logic ---
 
 def dump_ktext():
-    """
-    Dump the kernel .text section.
+    """Brute-force dump of the kernel .text section."""
 
-    Workflow:
-    1. Initialize r0gdb for kernel memory access
-    2. Read kernel_pmap_store to get dmap_base and CR3
-    3. Walk page tables to find .text boundaries
-    4. Stream .text via copyout over a socket connection
-    5. Save raw dump + metadata
-    """
-    print('=== PS5 Kernel .text Dumper ===')
+    print('=== PS5 Kernel .text Dumper (Brute-Force) ===')
     print()
 
     # Step 1: Initialize r0gdb
@@ -255,97 +271,140 @@ def dump_ktext():
     kdata_base = gdb.ieval('kdata_base')
     print('  kdata_base = %s' % hex(kdata_base))
 
-    # Set allproc for kernel R/W initialization
     gdb.eval('offsets.allproc = ' + ostr(kdata_base + symbols['allproc']))
     if not gdb.ieval('rpipe'):
         gdb.eval('r0gdb_init_with_offsets()')
     print('  kernel R/W initialized')
 
-    # Step 2: Get page table info from kernel_pmap_store
+    # Step 2: Get page table info
     print()
     print('[2/5] Reading kernel page map...')
     kpms_addr = kdata_base + symbols['kernel_pmap_store']
-
-    # kernel_pmap_store layout (FreeBSD pmap structure):
-    #   +32: pm_pml4  (virtual address of PML4 via dmap)
-    #   +40: pm_cr3   (physical address of PML4)
-    # dmap_base = pm_pml4 - pm_cr3
     dmap_virt = gdb.ieval('{void*}%d' % (kpms_addr + 32))
     cr3 = gdb.ieval('{void*}%d' % (kpms_addr + 40))
     dmap_base = dmap_virt - cr3
-
     print('  dmap_base = %s' % hex(dmap_base))
     print('  cr3       = %s' % hex(cr3))
 
-    # Step 3: Find .text boundaries
+    # Step 3: Find boundaries
     print()
-    print('[3/5] Finding .text section boundaries...')
+    print('[3/5] Finding .text boundaries...')
     text_start, text_end = find_text_boundaries(kdata_base, dmap_base, cr3)
     if text_start is None:
         print('FAILED: could not determine .text boundaries')
         return
 
     text_size = text_end - text_start
-    print()
-    print('  .text range: %s - %s' % (hex(text_start), hex(text_end)))
-    print('  .text size:  %d bytes (%.1f MB)' % (text_size, text_size / (1024 * 1024)))
+    n_pages = text_size // PAGE_SIZE
 
-    # Check if any pages in the range are executable (as expected for .text)
-    sample_addr = text_start + text_size // 2
-    if is_page_executable(sample_addr, dmap_base, cr3):
-        print('  executable:  yes (NX=0 confirmed at midpoint)')
+    # Allocate remote buffer for copyout
+    remote_buf = gdb.ieval('malloc(4096)')
+    one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
+
+    # Probe methods on a known address
+    print()
+    print('  probing read methods...')
+    negative_offsets = {k: v for k, v in symbols.items()
+                       if isinstance(v, int) and v < 0}
+    if negative_offsets:
+        most_neg = min(negative_offsets.values())
+        probe_addr = (kdata_base + most_neg) & ~0xFFF
     else:
-        print('  note: midpoint page is not marked executable (NX=1)')
-        print('        (this is expected on some FW versions with W^X)')
+        probe_addr = text_start
 
-    # Step 4: Dump the .text section via copyout + socket
+    probe_phys = virt2phys(probe_addr, dmap_base, cr3)
+
+    methods_avail = []
+    if probe_phys is not None:
+        d = try_copyout_page(remote_buf, dmap_base + probe_phys, one_second)
+        if d:
+            methods_avail.append('dmap_copyout')
+    d = try_copyout_page(remote_buf, probe_addr, one_second)
+    if d:
+        methods_avail.append('direct_copyout')
+    try:
+        v = gdb.ieval('kread8(%d)' % probe_addr)
+        if v:
+            methods_avail.append('kread8(nonzero)')
+        else:
+            methods_avail.append('kread8(zero)')
+    except Exception:
+        pass
+
+    print('  available methods: %s' % (methods_avail if methods_avail else 'NONE detected'))
+    if not methods_avail:
+        print('  WARNING: no method succeeded on probe -- will brute-force anyway')
+
+    # Step 4: Page-by-page brute-force dump
     print()
-    print('[4/5] Dumping .text section...')
+    print('[4/5] Brute-force dumping %d pages...' % n_pages)
 
-    local_buf = bytearray()
-    with gdb_rpc.BlobReceiver(gdb, local_buf, '  transferring') as addr:
-        remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)' % addr)
-        remote_buf = gdb.ieval('malloc(1048576)')
-        one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
-        total_sent = 0
+    dump_data = bytearray()
+    bitmap = bytearray(n_pages)
+    method_counts = [0, 0, 0, 0, 0]  # [fail, dmap, direct, kr8, kr8dmap]
+    pages_ok = 0
+    pages_fail = 0
+    t0 = time.time()
 
-        while total_sent < text_size:
-            chunk = min(1048576, text_size - total_sent)
-            src = text_start + total_sent
-            chk0 = gdb.ieval('copyout(%d, %d, %d)' % (remote_buf, src, chunk))
-            if chk0 <= 0:
-                print('\n  WARNING: copyout returned %d at offset %s' % (
-                    chk0, hex(total_sent)))
-                break
-            assert not gdb.ieval(
-                'r0gdb_sendall(%d, %d, %d)' % (remote_fd, remote_buf, chk0))
-            total_sent += chk0
+    for pg in range(n_pages):
+        vaddr = text_start + pg * PAGE_SIZE
 
-        # Wait for all data to arrive
-        while len(local_buf) != total_sent:
-            gdb.eval('(int)nanosleep(%d)' % one_second)
-        gdb.eval('(int)close(%d)' % remote_fd)
+        data, method = bruteforce_read_page(
+            vaddr, dmap_base, cr3, remote_buf, one_second)
 
-    print('  received %d bytes' % len(local_buf))
+        if data:
+            dump_data += data
+            bitmap[pg] = method
+            method_counts[method] += 1
+            pages_ok += 1
+        else:
+            # Fill with dead pattern
+            dump_data += DEAD_PATTERN * (PAGE_SIZE // len(DEAD_PATTERN))
+            bitmap[pg] = 0
+            method_counts[0] += 1
+            pages_fail += 1
 
-    # Step 5: Save output files
+        # Progress every 64 pages
+        if (pg + 1) % 64 == 0 or pg == n_pages - 1:
+            elapsed = time.time() - t0
+            pct = (pg + 1) * 100 // n_pages
+            eta = (elapsed / (pg + 1)) * (n_pages - pg - 1) if pg > 0 else 0
+            sys.stdout.write(
+                '\r  [%3d%%] page %d/%d  ok=%d fail=%d  '
+                '(%.0fs elapsed, ~%.0fs remaining)' % (
+                    pct, pg + 1, n_pages, pages_ok, pages_fail,
+                    elapsed, eta))
+            sys.stdout.flush()
+
+    print()
+    print('  done: %d/%d pages read (%.1f%%)' % (
+        pages_ok, n_pages, pages_ok * 100.0 / max(n_pages, 1)))
+    print('  methods: dmap=%d direct=%d kr8=%d kr8dmap=%d fail=%d' % (
+        method_counts[1], method_counts[2], method_counts[3],
+        method_counts[4], method_counts[0]))
+
+    # Step 5: Save output
     print()
     print('[5/5] Saving dump...')
 
-    # Get firmware version if possible
     try:
         fw_version = gdb.ieval('r0gdb_get_fw_version()') >> 16
     except Exception:
         fw_version = 0
 
-    # Save raw binary dump
+    # Raw binary
     with open(output_path, 'wb') as f:
-        f.write(local_buf)
+        f.write(dump_data)
 
-    # Save metadata as companion JSON
+    # Bitmap
+    bitmap_path = os.path.splitext(output_path)[0] + '_bitmap.bin'
+    with open(bitmap_path, 'wb') as f:
+        f.write(bitmap)
+
+    # Metadata
     meta_path = os.path.splitext(output_path)[0] + '_meta.json'
     metadata = {
-        'format': 'ps5_ktext_dump_v1',
+        'format': 'ps5_ktext_dump_v2',
         'text_base': hex(text_start),
         'text_end': hex(text_end),
         'text_size': text_size,
@@ -353,14 +412,22 @@ def dump_ktext():
         'dmap_base': hex(dmap_base),
         'cr3': hex(cr3),
         'fw_version': hex(fw_version) if fw_version else 'unknown',
+        'total_pages': n_pages,
+        'pages_ok': pages_ok,
+        'pages_fail': pages_fail,
+        'method_dmap': method_counts[1],
+        'method_direct': method_counts[2],
+        'method_kread8': method_counts[3],
+        'method_kread8_dmap': method_counts[4],
     }
     with open(meta_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    print('  raw dump: %s (%d bytes)' % (output_path, len(local_buf)))
-    print('  metadata: %s' % meta_path)
+    print('  raw dump:  %s (%d bytes)' % (output_path, len(dump_data)))
+    print('  bitmap:    %s' % bitmap_path)
+    print('  metadata:  %s' % meta_path)
 
-    # Print load instructions
+    # Load instructions
     print()
     print('=== Load Instructions ===')
     print('  Ghidra:  File > Import > Raw Binary')
@@ -371,7 +438,7 @@ def dump_ktext():
     print('           Processor: metapc (x86-64)')
     print('           Loading segment: %s' % hex(text_start))
 
-    # Validate against known offsets
+    # Validate known offsets
     print()
     print('=== Offset Validation ===')
     validated = 0
@@ -382,20 +449,23 @@ def dump_ktext():
         total_negative += 1
         func_addr = kdata_base + value
         file_offset = func_addr - text_start
-        if 0 <= file_offset < len(local_buf):
-            preview = local_buf[file_offset:file_offset + 8].hex()
-            print('  %-45s addr=%s off=0x%x [%s]' % (
-                key, hex(func_addr), file_offset, preview))
-            validated += 1
+        if 0 <= file_offset < len(dump_data):
+            preview = dump_data[file_offset:file_offset + 8].hex()
+            is_dead = dump_data[file_offset:file_offset + 4] == b'\xDE\xAD\xC0\xDE'
+            status = 'DEAD' if is_dead else 'ok'
+            print('  %-40s addr=%s off=0x%06x [%s] %s' % (
+                key, hex(func_addr), file_offset, preview, status))
+            if not is_dead:
+                validated += 1
         else:
-            print('  %-45s addr=%s OFF OUT OF RANGE' % (key, hex(func_addr)))
+            print('  %-40s addr=%s OUT OF RANGE' % (key, hex(func_addr)))
 
     if total_negative > 0:
         print()
-        print('  %d/%d known .text offsets validated in dump' % (
+        print('  %d/%d known .text offsets have real data in dump' % (
             validated, total_negative))
 
-    return bytes(local_buf), text_start
+    return bytes(dump_data), text_start
 
 
 # --- Entry Point ---

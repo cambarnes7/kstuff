@@ -122,26 +122,98 @@ def _read_pte(dmap_base, phys_addr):
     """Read a page table entry from its physical address via the dmap."""
     return gdb.ieval('{void*}%d' % (dmap_base + phys_addr))
 
-def _is_page_mapped(addr, dmap_base, cr3):
-    """Check if a kernel virtual address is mapped by walking x86-64 page tables."""
+def _virt2phys(addr, dmap_base, cr3):
+    """Walk x86-64 page tables to translate virtual -> physical.
+    Returns physical address or None if unmapped."""
     pml = cr3
     for shift in (39, 30, 21, 12):
         idx = (addr >> shift) & 0x1FF
         entry = _read_pte(dmap_base, pml + idx * 8)
         if not (entry & 1):
-            return False
+            return None
         if (entry & 0x80) or shift == 12:
-            return True
+            mask = (1 << shift) - 1
+            phys_base = entry & ((1 << 52) - (1 << shift))
+            return phys_base | (addr & mask)
         pml = entry & ((1 << 52) - (1 << 12))
-    return False
+    return None
+
+def _is_page_mapped(addr, dmap_base, cr3):
+    """Check if a kernel virtual address is mapped by walking x86-64 page tables."""
+    return _virt2phys(addr, dmap_base, cr3) is not None
+
+_DEAD_PATTERN = b'\xDE\xAD\xC0\xDE' * (0x1000 // 4)
+
+def _try_copyout_page(remote_buf, src_addr, one_second):
+    """Try to copyout a 4KB page from src_addr.  Returns bytes or None."""
+    try:
+        got = gdb.ieval('copyout(%d, %d, %d)' % (remote_buf, src_addr, 0x1000))
+        if got != 0x1000:
+            return None
+        local = bytearray()
+        with gdb_rpc.BlobReceiver(gdb, local, None) as addr:
+            fd = gdb.ieval('r0gdb_open_socket("%s", %d)' % addr)
+            assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)' % (fd, remote_buf, 0x1000))
+            while len(local) < 0x1000:
+                gdb.eval('(int)nanosleep(%d)' % one_second)
+            gdb.eval('(int)close(%d)' % fd)
+        if len(local) >= 0x1000:
+            return bytes(local[:0x1000])
+    except Exception:
+        pass
+    return None
+
+def _try_kread8_page(addr):
+    """Read a 4KB page 8 bytes at a time via kread8.  Returns bytes or None."""
+    import struct
+    result = bytearray(0x1000)
+    any_nonzero = False
+    for off in range(0, 0x1000, 8):
+        try:
+            val = gdb.ieval('kread8(%d)' % (addr + off))
+        except Exception:
+            val = 0
+        struct.pack_into('<Q', result, off, val)
+        if val:
+            any_nonzero = True
+    return bytes(result) if any_nonzero else None
+
+def _bruteforce_read_page(vaddr, dmap_base, cr3, remote_buf, one_second):
+    """Try every method to read a 4KB page.  Returns (data, method) or (None, 0)."""
+    phys = _virt2phys(vaddr, dmap_base, cr3)
+
+    # Method 1: copyout from DMAP+physical
+    if phys is not None:
+        data = _try_copyout_page(remote_buf, dmap_base + phys, one_second)
+        if data:
+            return data, 1
+
+    # Method 2: copyout from virtual address directly
+    data = _try_copyout_page(remote_buf, vaddr, one_second)
+    if data:
+        return data, 2
+
+    # Method 3: kread8 from virtual address
+    data = _try_kread8_page(vaddr)
+    if data:
+        return data, 3
+
+    # Method 4: kread8 from DMAP+physical
+    if phys is not None:
+        data = _try_kread8_page(dmap_base + phys)
+        if data:
+            return data, 4
+
+    return None, 0
 
 @retry_on_error
 def dump_ktext():
     """
-    Dump the kernel .text section by scanning backward from kdata_base.
+    Brute-force dump of the kernel .text section.
 
-    Uses firmware offsets and page table walking via kernel_pmap_store to
-    find the .text boundaries, then streams the section over a socket.
+    Scans backward from kdata_base using page table walking to find the
+    .text boundaries, then reads page-by-page trying multiple methods.
+    Pages that cannot be read are filled with 0xDEADC0DE.
     Returns (text_bytes, text_base_address).
     """
     gdb.use_r0gdb(R0GDB_FLAGS)
@@ -155,59 +227,68 @@ def dump_ktext():
     cr3 = gdb.ieval('{void*}%d' % (kpms + 40))
     dmap_base = dmap_virt - cr3
 
-    # Find the most negative known offset to use as a .text landmark
+    # Use ALL negative offsets as landmarks
     most_negative = 0
-    for k in available_symbols:
-        if k in symbols and isinstance(symbols[k], int) and symbols[k] < most_negative:
-            most_negative = symbols[k]
+    for k, v in symbols.items():
+        if isinstance(v, int) and v < most_negative:
+            most_negative = v
     if most_negative == 0:
-        most_negative = -0xA00000  # default ~10MB
+        most_negative = -0xA00000
 
     known_code = (kdata_base + most_negative) & ~0xFFF
 
-    # Coarse scan backward (2MB steps) to find approximate boundary
-    step = 0x200000
+    # Scan backward from deepest known offset to find actual .text start
+    text_start = known_code
+    consecutive_unmapped = 0
     addr = known_code
-    unmapped_addr = None
-    while kdata_base - addr < 0x2000000:  # 32MB limit
-        addr -= step
-        if not _is_page_mapped(addr, dmap_base, cr3):
-            unmapped_addr = addr
-            break
-
-    if unmapped_addr is None:
-        text_start = kdata_base - 0x2000000
-    else:
-        # Binary search for exact boundary (4KB precision)
-        lo, hi = unmapped_addr, unmapped_addr + step
-        while hi - lo > 0x1000:
-            mid = ((lo + hi) // 2) & ~0xFFF
-            if _is_page_mapped(mid, dmap_base, cr3):
-                hi = mid
-            else:
-                lo = mid + 0x1000
-        text_start = hi
+    for _ in range(8192):  # up to 32 MB backward
+        addr -= 0x1000
+        if _is_page_mapped(addr, dmap_base, cr3):
+            consecutive_unmapped = 0
+            text_start = addr
+        else:
+            consecutive_unmapped += 1
+            if consecutive_unmapped >= 4:
+                break
 
     text_size = kdata_base - text_start
-    print('ktext: %s - %s (%d bytes, %.1f MB)' % (
-        hex(text_start), hex(kdata_base), text_size, text_size / (1024*1024)))
+    n_pages = text_size // 0x1000
+    print('ktext: %s - %s (%d bytes, %.1f MB, %d pages)' % (
+        hex(text_start), hex(kdata_base), text_size, text_size / (1024*1024), n_pages))
 
-    # Dump via copyout + socket (same pattern as dump_kernel)
-    local_buf = bytearray()
-    with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping ktext') as addr:
-        remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
-        remote_buf = gdb.ieval('malloc(1048576)')
-        one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
-        total_sent = 0
-        while total_sent < text_size:
-            chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, text_start+total_sent, min(1048576, text_size - total_sent)))
-            if chk0 <= 0: break
-            assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
-            total_sent += chk0
-        while len(local_buf) != total_sent:
-            gdb.eval('(int)nanosleep(%d)'%one_second)
-        gdb.eval('(int)close(%d)'%remote_fd)
-    return bytes(local_buf), text_start
+    # Allocate remote buffer for copyout
+    remote_buf = gdb.ieval('malloc(4096)')
+    one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
+
+    # Page-by-page brute-force dump
+    dump_data = bytearray()
+    pages_ok = 0
+    pages_fail = 0
+    method_counts = [0, 0, 0, 0, 0]
+    t0 = time.time()
+
+    for pg in range(n_pages):
+        vaddr = text_start + pg * 0x1000
+        data, method = _bruteforce_read_page(vaddr, dmap_base, cr3, remote_buf, one_second)
+        if data:
+            dump_data += data
+            method_counts[method] += 1
+            pages_ok += 1
+        else:
+            dump_data += _DEAD_PATTERN
+            method_counts[0] += 1
+            pages_fail += 1
+        if (pg + 1) % 256 == 0 or pg == n_pages - 1:
+            elapsed = time.time() - t0
+            eta = (elapsed / (pg + 1)) * (n_pages - pg - 1) if pg > 0 else 0
+            sys.stdout.write('\rktext: %d/%d pages  ok=%d fail=%d  (%.0fs, ~%.0fs left)' % (
+                pg + 1, n_pages, pages_ok, pages_fail, elapsed, eta))
+            sys.stdout.flush()
+    print()
+    print('ktext done: %d/%d pages (%.1f%%)  dmap=%d direct=%d kr8=%d kr8dmap=%d' % (
+        pages_ok, n_pages, pages_ok * 100.0 / max(n_pages, 1),
+        method_counts[1], method_counts[2], method_counts[3], method_counts[4]))
+    return bytes(dump_data), text_start
 
 def get_ktext(_cache=[]):
     if not _cache:
