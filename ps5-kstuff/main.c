@@ -554,146 +554,22 @@ static void dump_ktext_to_usb(void)
     }
     else if(!(dmap_pte & 1))
     {
-        // dmap has no mapping for .text physical pages — create one.
-        // Walk the dmap page table to find where the hole is.
+        // dmap has no mapping — try creating a PTE
         int hole_level = 0;
         uint64_t hole_addr = find_pte_hole(dmap + test_phys, &hole_level,
                                             dmap, cr3);
-
         if(hole_addr && hole_level <= 21)
         {
-            // Build the PTE value
-            uint64_t pte_val;
-            if(hole_level == 21)
-            {
-                // 2MB PDE: phys base (2MB-aligned) | P|RW|A|D|PS|NX
-                pte_val = (test_phys & ~0x1FFFFFull)
-                        | 0x80000000000000E3ull;
-            }
-            else
-            {
-                // 4KB PTE: phys page | P|RW|A|D|NX
-                pte_val = (test_phys & ~0xFFFull)
-                        | 0x8000000000000063ull;
-            }
-
-            // Step 1: notify BEFORE writing PTE
-            {
-                char msg[120];
-                char* p = msg;
-                append_str(&p, "ktext: step1 l=");
-                fmt_dec(&p, hole_level);
-                append_str(&p, " a=");
-                fmt_hex64(&p, hole_addr);
-                append_str(&p, " v=");
-                fmt_hex64(&p, pte_val);
-                *p = 0;
-                notify(msg);
-            }
-
-            // Step 2: write PTE via copyin
+            uint64_t pte_val = (hole_level == 21)
+                ? ((test_phys & ~0x1FFFFFull) | 0x80000000000000E3ull)
+                : ((test_phys & ~0xFFFull)    | 0x8000000000000063ull);
             copyin(hole_addr, &pte_val, 8);
-            notify("ktext: step2 pte written");
-
-            // Step 3: flush TLB by reloading CR3
             r0gdb_write_cr3(r0gdb_read_cr3());
-            notify("ktext: step3 tlb flushed");
-
-            // Step 4: test read via kfncall+copyout (pcb_onfault = safe)
             uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
                 (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
-
-            {
-                char msg[80];
-                char* p = msg;
-                append_str(&p, "ktext: step4 ret=");
-                fmt_dec(&p, kcpy_ret);
-                if(kcpy_ret == 0)
-                {
-                    append_str(&p, " val=");
-                    fmt_hex64(&p, test_val);
-                }
-                *p = 0;
-                notify(msg);
-            }
-
             if(kcpy_ret == 0)
                 read_method = 2;
         }
-        else if(hole_addr && hole_level > 21)
-        {
-            // Hole is at PDPT or PML4 level — need to allocate page table pages.
-            {
-                char msg[60];
-                char* p = msg;
-                append_str(&p, "ktext: hole at level ");
-                fmt_dec(&p, hole_level);
-                append_str(&p, " - allocating PT");
-                *p = 0;
-                notify(msg);
-            }
-            uint64_t new_pt = r0gdb_kmalloc(0x1000);
-            if(new_pt)
-            {
-                // Zero it (kmalloc may not zero)
-                char zeros[64];
-                for(int z = 0; z < 64; z++) zeros[z] = 0;
-                for(int off = 0; off < 0x1000; off += 64)
-                    copyin(new_pt + off, zeros, 64);
-
-                // Get physical address of the new page table page
-                uint64_t new_pt_phys = virt2phys(new_pt, 0, dmap, cr3);
-                if(new_pt_phys != (uint64_t)-1)
-                {
-                    // Write intermediate entry: phys | P|RW|U|A
-                    uint64_t inter_val = (new_pt_phys & ~0xFFFull) | 0x67ull;
-                    copyin(hole_addr, &inter_val, 8);
-
-                    // Now find the next hole (should be at a lower level)
-                    int hole2_level = 0;
-                    uint64_t hole2_addr = find_pte_hole(dmap + test_phys,
-                                                         &hole2_level, dmap, cr3);
-                    if(hole2_addr && hole2_level <= 21)
-                    {
-                        uint64_t pte_val;
-                        if(hole2_level == 21)
-                            pte_val = (test_phys & ~0x1FFFFFull)
-                                    | 0x80000000000000E3ull;
-                        else
-                            pte_val = (test_phys & ~0xFFFull)
-                                    | 0x8000000000000063ull;
-                        copyin(hole2_addr, &pte_val, 8);
-                    }
-                }
-
-                r0gdb_write_cr3(r0gdb_read_cr3());
-
-                uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
-                    (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
-
-                {
-                    char msg[80];
-                    char* p = msg;
-                    append_str(&p, "ktext: pte_alloc ret=");
-                    fmt_dec(&p, kcpy_ret);
-                    *p = 0;
-                    notify(msg);
-                }
-
-                if(kcpy_ret == 0)
-                    read_method = 2;
-            }
-        }
-    }
-
-    // If still no method, try kfncall from dmap+phys directly (may work if
-    // PTE creation succeeded for a different reason)
-    if(!read_method)
-    {
-        uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
-            (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
-        if(kcpy_ret == 0)
-            read_method = 2;
     }
 
     if(!read_method)
@@ -727,6 +603,25 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
+    // If using method 2, create dmap mappings for all .text 2MB pages upfront
+    if(read_method == 2)
+    {
+        for(uint64_t a = text_start; a < text_end; a += 0x200000)
+        {
+            uint64_t ph_limit;
+            uint64_t ph = virt2phys(a, &ph_limit, dmap, cr3);
+            if(ph == (uint64_t)-1) continue;
+            int hl = 0;
+            uint64_t ha = find_pte_hole(dmap + ph, &hl, dmap, cr3);
+            if(ha && hl == 21)
+            {
+                uint64_t pv = (ph & ~0x1FFFFFull) | 0x80000000000000E3ull;
+                copyin(ha, &pv, 8);
+            }
+        }
+        r0gdb_write_cr3(r0gdb_read_cr3());
+    }
+
     size_t chunk_sz = 0x1000; // 4KB
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
@@ -748,30 +643,6 @@ static void dump_ktext_to_usb(void)
 
         if(read_method == 2)
         {
-            // ensure dmap mapping exists for this physical page
-            uint64_t dmap_check = read_pte_raw(dmap + phys, dmap, cr3);
-            if(!(dmap_check & 1))
-            {
-                // no mapping — create one (same logic as the test)
-                int hl = 0;
-                uint64_t ha = find_pte_hole(dmap + phys, &hl, dmap, cr3);
-                if(ha && hl == 21)
-                {
-                    uint64_t pv = (phys & ~0x1FFFFFull)
-                                | 0x80000000000000E3ull;
-                    copyin(ha, &pv, 8);
-                    r0gdb_write_cr3(r0gdb_read_cr3());
-                }
-                else if(ha && hl == 12)
-                {
-                    uint64_t pv = (phys & ~0xFFFull)
-                                | 0x8000000000000063ull;
-                    copyin(ha, &pv, 8);
-                    r0gdb_write_cr3(r0gdb_read_cr3());
-                }
-            }
-
-            // kernel copyout from dmap+phys via r0gdb_kfncall
             uint64_t ret = r0gdb_kfncall(offsets.copyout,
                 (uint64_t)(dmap + phys), (uint64_t)buf, (uint64_t)to_read);
             if(ret != 0) { err = 1; break; }
@@ -779,7 +650,6 @@ static void dump_ktext_to_usb(void)
         }
         else
         {
-            // dmap via pipe (fast path)
             ssize_t got = copyout(buf, dmap + phys, to_read);
             if(got <= 0) { err = 1; break; }
             if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
