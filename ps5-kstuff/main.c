@@ -562,9 +562,7 @@ static void dump_ktext_to_usb(void)
 
         if(hole_addr && hole_level <= 21)
         {
-            // Create a 2MB PDE or 4KB PTE mapping the .text physical page.
-            // .text uses 2MB pages (tp shows PS bit), so phys is 2MB-aligned
-            // at the PD level. Use NX since this is a data-read mapping.
+            // Build the PTE value
             uint64_t pte_val;
             if(hole_level == 21)
             {
@@ -579,16 +577,11 @@ static void dump_ktext_to_usb(void)
                         | 0x8000000000000063ull;
             }
 
-            copyin(hole_addr, &pte_val, 8);
-
-            // flush TLB by reloading CR3
-            r0gdb_write_cr3(r0gdb_read_cr3());
-
-            // diagnostic: show what we wrote
+            // Step 1: notify BEFORE writing PTE
             {
                 char msg[120];
                 char* p = msg;
-                append_str(&p, "ktext: pte_write l=");
+                append_str(&p, "ktext: step1 l=");
                 fmt_dec(&p, hole_level);
                 append_str(&p, " a=");
                 fmt_hex64(&p, hole_addr);
@@ -598,14 +591,22 @@ static void dump_ktext_to_usb(void)
                 notify(msg);
             }
 
-            // test the new mapping via kfncall+copyout (pcb_onfault = safe)
+            // Step 2: write PTE via copyin
+            copyin(hole_addr, &pte_val, 8);
+            notify("ktext: step2 pte written");
+
+            // Step 3: flush TLB by reloading CR3
+            r0gdb_write_cr3(r0gdb_read_cr3());
+            notify("ktext: step3 tlb flushed");
+
+            // Step 4: test read via kfncall+copyout (pcb_onfault = safe)
             uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
                 (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
 
             {
                 char msg[80];
                 char* p = msg;
-                append_str(&p, "ktext: pte_test ret=");
+                append_str(&p, "ktext: step4 ret=");
                 fmt_dec(&p, kcpy_ret);
                 if(kcpy_ret == 0)
                 {
@@ -622,7 +623,15 @@ static void dump_ktext_to_usb(void)
         else if(hole_addr && hole_level > 21)
         {
             // Hole is at PDPT or PML4 level — need to allocate page table pages.
-            // Allocate a zeroed page for the next level down.
+            {
+                char msg[60];
+                char* p = msg;
+                append_str(&p, "ktext: hole at level ");
+                fmt_dec(&p, hole_level);
+                append_str(&p, " - allocating PT");
+                *p = 0;
+                notify(msg);
+            }
             uint64_t new_pt = r0gdb_kmalloc(0x1000);
             if(new_pt)
             {
