@@ -462,38 +462,28 @@ static void dump_ktext_to_usb(void)
     }
 
     // Determine which read method works.
-    // All .text VA reads panic (kread8, pipe-copyout, kfncall).
-    // Pipe-copyout from dmap+phys returns EFAULT (doesn't panic).
-    // Try: kmemcpy from dmap+phys to kernel buffer, then pipe-copyout from buffer.
-    // kmemcpy uses int 179 (ring-0 rep movsb) -- different code path than pipe.
-    uint64_t test_val;
+    // All .text VA reads panic regardless of fault handling.
+    // kmemcpy (rep movsb) from dmap+phys also panics (no pcb_onfault).
+    // Pipe-copyout from dmap+phys returns EFAULT safely (has pcb_onfault).
+    // Kernel's native copyout via r0gdb_kfncall also has pcb_onfault.
+    // Strategy: try pipe-copyout first (fast), then kernel copyout (safe).
+    uint64_t test_val = 0;
     ssize_t dmap_pipe_test = copyout(&test_val, dmap + test_phys, 8);
-
-    // allocate a kernel buffer for kmemcpy intermediary
-    uint64_t kbuf = r0gdb_kmalloc(0x1000);
-    int read_method = 0; // 0=unknown, 1=dmap-pipe, 2=kmemcpy+pipe, 3=kfncall-dmap
+    int read_method = 0; // 0=unknown, 1=dmap-pipe, 2=kfncall-dmap
+    uint64_t kcpy_ret = (uint64_t)-1;
 
     if(dmap_pipe_test > 0)
     {
         read_method = 1; // dmap via pipe works directly
     }
-    else if(kbuf)
-    {
-        // try kmemcpy from dmap+phys to kernel buffer, then pipe-copyout
-        // kmemcpy uses rep movsb in ring 0 -- may succeed where pipe fails
-        kmemcpy((void*)kbuf, (void*)(dmap + test_phys), 8);
-        ssize_t kb_test = copyout(&test_val, kbuf, 8);
-        if(kb_test > 0 && test_val != 0)
-            read_method = 2;
-    }
-
-    if(!read_method && kbuf)
+    else
     {
         // try kernel's native copyout from dmap+phys via r0gdb_kfncall
-        uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
+        // kernel copyout has pcb_onfault -- will return EFAULT, not panic
+        kcpy_ret = r0gdb_kfncall(offsets.copyout,
             (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
         if(kcpy_ret == 0)
-            read_method = 3;
+            read_method = 2;
     }
 
     // diagnostic notification
@@ -504,13 +494,10 @@ static void dump_ktext_to_usb(void)
         fmt_hex64(&p, text_size);
         append_str(&p, " dp=");
         fmt_dec(&p, (uint64_t)dmap_pipe_test);
+        append_str(&p, " kc=");
+        fmt_dec(&p, kcpy_ret);
         append_str(&p, " m=");
         fmt_dec(&p, read_method);
-        if(read_method == 2)
-        {
-            append_str(&p, " v=");
-            fmt_hex64(&p, test_val);
-        }
         *p = 0;
         notify(msg);
     }
@@ -566,14 +553,6 @@ static void dump_ktext_to_usb(void)
         if(remaining < to_read) to_read = remaining;
 
         if(read_method == 2)
-        {
-            // kmemcpy: dmap+phys → kernel buffer, then pipe-copyout
-            kmemcpy((void*)kbuf, (void*)(dmap + phys), to_read);
-            ssize_t got = copyout(buf, kbuf, to_read);
-            if(got <= 0) { err = 1; break; }
-            if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
-        }
-        else if(read_method == 3)
         {
             // kernel copyout from dmap+phys via r0gdb_kfncall
             uint64_t ret = r0gdb_kfncall(offsets.copyout,
