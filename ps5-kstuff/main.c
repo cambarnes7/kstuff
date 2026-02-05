@@ -377,73 +377,6 @@ static uint64_t walk_pte(uint64_t vaddr, uint64_t dmap, uint64_t cr3)
     return 0;
 }
 
-static int find_ktext_bounds(uint64_t* text_start, uint64_t* text_end,
-                             uint64_t dmap, uint64_t cr3)
-{
-    *text_end = kdata_base;
-
-    // use the most negative known code offsets as .text landmarks
-    uint64_t candidates[] = {
-        offsets.cpu_switch,
-        offsets.doreti_iret,
-        offsets.copyin,
-        offsets.copyout,
-        offsets.push_pop_all_iret,
-        offsets.malloc,
-        offsets.justreturn,
-        offsets.sceSblServiceMailbox,
-        offsets.eventhandler_register,
-    };
-    uint64_t landmark = kdata_base;
-    for(int i = 0; i < (int)(sizeof(candidates)/sizeof(candidates[0])); i++)
-        if(candidates[i] && candidates[i] < landmark
-           && candidates[i] > 0xffffffff00000000ull)
-            landmark = candidates[i];
-
-    if(landmark == kdata_base)
-        return -1;
-
-    landmark &= ~0xFFFull;
-
-    if(!walk_pte(landmark, dmap, cr3))
-        return -1;
-
-    // coarse scan backward in 2MB steps
-    uint64_t step = 0x200000;
-    uint64_t addr = landmark;
-    uint64_t unmapped = 0;
-    while(kdata_base - addr < 0x2000000) // 32MB limit
-    {
-        addr -= step;
-        if(!walk_pte(addr, dmap, cr3))
-        {
-            unmapped = addr;
-            break;
-        }
-    }
-
-    if(!unmapped)
-    {
-        *text_start = kdata_base - 0x2000000;
-        return 0;
-    }
-
-    // binary search to 4KB precision
-    uint64_t lo = unmapped;
-    uint64_t hi = unmapped + step;
-    while(hi - lo > 0x1000)
-    {
-        uint64_t mid = ((lo + hi) / 2) & ~0xFFFull;
-        if(walk_pte(mid, dmap, cr3))
-            hi = mid;
-        else
-            lo = mid + 0x1000;
-    }
-
-    *text_start = hi;
-    return 0;
-}
-
 static void append_str(char** pp, const char* s)
 {
     char* p = *pp;
@@ -497,24 +430,59 @@ static void dump_ktext_to_usb(void)
 
     notify("Dumping kernel .text to USB...");
 
-    // read dmap_base + cr3 from kernel_pmap_store
+    // compute .text range from known offsets (no page table walking)
+    uint64_t candidates[] = {
+        offsets.cpu_switch,
+        offsets.doreti_iret,
+        offsets.copyin,
+        offsets.copyout,
+        offsets.push_pop_all_iret,
+        offsets.malloc,
+        offsets.justreturn,
+        offsets.sceSblServiceMailbox,
+        offsets.eventhandler_register,
+    };
+    uint64_t landmark = kdata_base;
+    for(int i = 0; i < (int)(sizeof(candidates)/sizeof(candidates[0])); i++)
+        if(candidates[i] && candidates[i] < landmark
+           && candidates[i] > (kdata_base - 0x2000000))
+            landmark = candidates[i];
+
+    if(landmark == kdata_base)
+    {
+        notify("ktext dump FAILED: no .text offsets found");
+        return;
+    }
+
+    // round down to 2MB boundary and add 2MB margin
+    uint64_t text_start = (landmark & ~0x1FFFFFull) - 0x200000;
+    uint64_t text_end = kdata_base;
+    uint64_t text_size = text_end - text_start;
+    if(text_size > 0x2000000) // cap at 32MB
+    {
+        text_start = kdata_base - 0x2000000;
+        text_size = 0x2000000;
+    }
+
+    // read dmap/cr3 for optional per-chunk page validation
     uint64_t ptrs[2];
     copyout(ptrs, offsets.kernel_pmap_store + 32, sizeof(ptrs));
     uint64_t dmap = ptrs[0] - ptrs[1];
     uint64_t cr3 = ptrs[1];
 
-    // find .text boundaries via page table walk
-    uint64_t text_start, text_end;
-    if(find_ktext_bounds(&text_start, &text_end, dmap, cr3))
+    // test if walk_pte works on a known-good address
+    int pte_works = (walk_pte(landmark, dmap, cr3) != 0);
+
+    // diagnostic notification
     {
-        notify("ktext dump FAILED: boundary detection");
-        return;
-    }
-    uint64_t text_size = text_end - text_start;
-    if(text_size < 0x100000 || text_size > 0x2000000)
-    {
-        notify("ktext dump FAILED: unreasonable size");
-        return;
+        char msg[128];
+        char* p = msg;
+        append_str(&p, "ktext: sz=");
+        fmt_hex64(&p, text_size);
+        append_str(&p, " pte=");
+        *p++ = pte_works ? '1' : '0';
+        *p = 0;
+        notify(msg);
     }
 
     // build usb path prefix
@@ -544,6 +512,7 @@ static void dump_ktext_to_usb(void)
 
     size_t chunk_sz = 0x10000; // 64KB
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+    char* zeros = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
     uint64_t total = 0;
     int err = 0;
@@ -552,13 +521,27 @@ static void dump_ktext_to_usb(void)
         size_t to_read = chunk_sz;
         if(text_size - total < to_read)
             to_read = text_size - total;
-        ssize_t got = copyout(buf, text_start + total, to_read);
-        if(got <= 0) { err = 1; break; }
-        if(write(fd, buf, got) != got) { err = 2; break; }
-        total += got;
+
+        uint64_t addr = text_start + total;
+        int mapped = 1;
+        if(pte_works && !walk_pte(addr, dmap, cr3))
+            mapped = 0;
+
+        if(mapped)
+        {
+            ssize_t got = copyout(buf, addr, to_read);
+            if(got <= 0) { err = 1; break; }
+            if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
+        }
+        else
+        {
+            if(write(fd, zeros, to_read) != (ssize_t)to_read) { err = 2; break; }
+        }
+        total += to_read;
     }
     close(fd);
     munmap(buf, chunk_sz);
+    munmap(zeros, chunk_sz);
 
     if(err)
     {
@@ -585,6 +568,7 @@ static void dump_ktext_to_usb(void)
         append_str(&p, "kdata_base="); fmt_hex64(&p, kdata_base); *p++ = '\n';
         append_str(&p, "dmap_base=");  fmt_hex64(&p, dmap);       *p++ = '\n';
         append_str(&p, "cr3=");        fmt_hex64(&p, cr3);        *p++ = '\n';
+        append_str(&p, "pte_works=");  *p++ = pte_works ? '1' : '0'; *p++ = '\n';
         append_str(&p, "fw_version="); fmt_hex64(&p, fwver);      *p++ = '\n';
         *p = 0;
 
