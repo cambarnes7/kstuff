@@ -564,7 +564,6 @@ static void dump_ktext_to_usb(void)
                 ? ((test_phys & ~0x1FFFFFull) | 0x80000000000000E3ull)
                 : ((test_phys & ~0xFFFull)    | 0x8000000000000063ull);
             copyin(hole_addr, &pte_val, 8);
-            r0gdb_write_cr3(r0gdb_read_cr3());
             uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
                 (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
             if(kcpy_ret == 0)
@@ -619,7 +618,6 @@ static void dump_ktext_to_usb(void)
                 copyin(ha, &pv, 8);
             }
         }
-        r0gdb_write_cr3(r0gdb_read_cr3());
     }
 
     size_t chunk_sz = 0x1000; // 4KB
