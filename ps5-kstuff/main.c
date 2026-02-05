@@ -461,16 +461,28 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
+    // test if we can actually read .text physical memory through dmap
+    uint64_t test_val;
+    ssize_t test_got = copyout(&test_val, dmap + test_phys, 8);
+
     // diagnostic notification
     {
         char msg[128];
         char* p = msg;
         append_str(&p, "ktext: sz=");
         fmt_hex64(&p, text_size);
-        append_str(&p, " dmap=");
-        fmt_hex64(&p, dmap);
+        append_str(&p, " trd=");
+        fmt_dec(&p, (uint64_t)test_got);
+        append_str(&p, " ph=");
+        fmt_hex64(&p, test_phys);
         *p = 0;
         notify(msg);
+    }
+
+    if(test_got <= 0)
+    {
+        notify("ktext dump FAILED: dmap read blocked");
+        return;
     }
 
     // build usb path prefix
@@ -499,7 +511,7 @@ static void dump_ktext_to_usb(void)
     }
 
     // read .text via dmap (physical) to bypass execute-only virtual mapping
-    size_t chunk_sz = 0x10000; // 64KB
+    size_t chunk_sz = 0x1000; // 4KB -- largest proven copyout size in codebase
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
     uint64_t total = 0;
