@@ -461,24 +461,39 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // determine which read method works
-    // Tier 1: pipe-copyout from dmap+phys (fast)
-    // Tier 2: kernel's native copyout via r0gdb_kfncall (has pcb_onfault)
+    // Determine which read method works.
+    // All .text VA reads panic (kread8, pipe-copyout, kfncall).
+    // Pipe-copyout from dmap+phys returns EFAULT (doesn't panic).
+    // Try: kmemcpy from dmap+phys to kernel buffer, then pipe-copyout from buffer.
+    // kmemcpy uses int 179 (ring-0 rep movsb) -- different code path than pipe.
     uint64_t test_val;
-    ssize_t dmap_test = copyout(&test_val, dmap + test_phys, 8);
-    int read_method = 0; // 0=unknown, 1=dmap, 2=kfncall
+    ssize_t dmap_pipe_test = copyout(&test_val, dmap + test_phys, 8);
 
-    if(dmap_test > 0)
+    // allocate a kernel buffer for kmemcpy intermediary
+    uint64_t kbuf = r0gdb_kmalloc(0x1000);
+    int read_method = 0; // 0=unknown, 1=dmap-pipe, 2=kmemcpy+pipe, 3=kfncall-dmap
+
+    if(dmap_pipe_test > 0)
     {
-        read_method = 1;
+        read_method = 1; // dmap via pipe works directly
     }
-    else
+    else if(kbuf)
     {
-        // dmap read failed; try kernel's native copyout which has pcb_onfault
-        uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
-            (uint64_t)landmark, (uint64_t)&test_val, (uint64_t)8);
-        if(kcpy_ret == 0)
+        // try kmemcpy from dmap+phys to kernel buffer, then pipe-copyout
+        // kmemcpy uses rep movsb in ring 0 -- may succeed where pipe fails
+        kmemcpy((void*)kbuf, (void*)(dmap + test_phys), 8);
+        ssize_t kb_test = copyout(&test_val, kbuf, 8);
+        if(kb_test > 0 && test_val != 0)
             read_method = 2;
+    }
+
+    if(!read_method && kbuf)
+    {
+        // try kernel's native copyout from dmap+phys via r0gdb_kfncall
+        uint64_t kcpy_ret = r0gdb_kfncall(offsets.copyout,
+            (uint64_t)(dmap + test_phys), (uint64_t)&test_val, (uint64_t)8);
+        if(kcpy_ret == 0)
+            read_method = 3;
     }
 
     // diagnostic notification
@@ -487,10 +502,15 @@ static void dump_ktext_to_usb(void)
         char* p = msg;
         append_str(&p, "ktext: sz=");
         fmt_hex64(&p, text_size);
-        append_str(&p, " dmap=");
-        fmt_dec(&p, (uint64_t)dmap_test);
-        append_str(&p, " method=");
+        append_str(&p, " dp=");
+        fmt_dec(&p, (uint64_t)dmap_pipe_test);
+        append_str(&p, " m=");
         fmt_dec(&p, read_method);
+        if(read_method == 2)
+        {
+            append_str(&p, " v=");
+            fmt_hex64(&p, test_val);
+        }
         *p = 0;
         notify(msg);
     }
@@ -532,58 +552,56 @@ static void dump_ktext_to_usb(void)
     uint64_t total = 0;
     int err = 0;
 
-    if(read_method == 2)
+    while(total < text_size)
     {
-        // Tier 2: kernel's native copyout via r0gdb_kfncall
-        // The kernel's copyout(kaddr, uaddr, len) has built-in pcb_onfault
-        while(total < text_size)
-        {
-            uint64_t vaddr = text_start + total;
-            uint64_t remaining = text_size - total;
-            size_t to_read = chunk_sz;
-            if(remaining < to_read) to_read = remaining;
+        uint64_t vaddr = text_start + total;
+        uint64_t phys_limit;
+        uint64_t phys = virt2phys(vaddr, &phys_limit, dmap, cr3);
+        if(phys == (uint64_t)-1) { err = 3; break; }
 
+        uint64_t page_avail = phys_limit - phys;
+        uint64_t remaining = text_size - total;
+        size_t to_read = chunk_sz;
+        if(page_avail < to_read) to_read = page_avail;
+        if(remaining < to_read) to_read = remaining;
+
+        if(read_method == 2)
+        {
+            // kmemcpy: dmap+phys → kernel buffer, then pipe-copyout
+            kmemcpy((void*)kbuf, (void*)(dmap + phys), to_read);
+            ssize_t got = copyout(buf, kbuf, to_read);
+            if(got <= 0) { err = 1; break; }
+            if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
+        }
+        else if(read_method == 3)
+        {
+            // kernel copyout from dmap+phys via r0gdb_kfncall
             uint64_t ret = r0gdb_kfncall(offsets.copyout,
-                (uint64_t)vaddr, (uint64_t)buf, (uint64_t)to_read);
+                (uint64_t)(dmap + phys), (uint64_t)buf, (uint64_t)to_read);
             if(ret != 0) { err = 1; break; }
             if(write(fd, buf, to_read) != (ssize_t)to_read) { err = 2; break; }
-            total += to_read;
-
-            // progress notification every 1 MB
-            if((total & 0xFFFFF) == 0 && total > 0)
-            {
-                char msg[64];
-                char* p = msg;
-                append_str(&p, "ktext dump: ");
-                fmt_dec(&p, total / (1024 * 1024));
-                append_str(&p, "/");
-                fmt_dec(&p, text_size / (1024 * 1024));
-                append_str(&p, " MB");
-                *p = 0;
-                notify(msg);
-            }
         }
-    }
-    else
-    {
-        // Tier 1: pipe-copyout via dmap physical addresses (fast path)
-        while(total < text_size)
+        else
         {
-            uint64_t vaddr = text_start + total;
-            uint64_t phys_limit;
-            uint64_t phys = virt2phys(vaddr, &phys_limit, dmap, cr3);
-            if(phys == (uint64_t)-1) { err = 3; break; }
-
-            uint64_t page_avail = phys_limit - phys;
-            uint64_t remaining = text_size - total;
-            size_t to_read = chunk_sz;
-            if(page_avail < to_read) to_read = page_avail;
-            if(remaining < to_read) to_read = remaining;
-
+            // dmap via pipe (fast path)
             ssize_t got = copyout(buf, dmap + phys, to_read);
             if(got <= 0) { err = 1; break; }
             if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
-            total += to_read;
+        }
+        total += to_read;
+
+        // progress notification every 1 MB
+        if((total & 0xFFFFF) == 0 && total > 0)
+        {
+            char msg[64];
+            char* p = msg;
+            append_str(&p, "ktext dump: ");
+            fmt_dec(&p, total / (1024 * 1024));
+            append_str(&p, "/");
+            fmt_dec(&p, text_size / (1024 * 1024));
+            append_str(&p, " MB");
+            *p = 0;
+            notify(msg);
         }
     }
     close(fd);
