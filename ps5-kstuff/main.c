@@ -445,12 +445,30 @@ static void dump_ktext_to_usb(void)
     uint64_t text_end = kdata_base;
     uint64_t text_size = text_end - text_start;
 
+    // get dmap + cr3 for virtual-to-physical translation
+    // kernel .text may be execute-only (XOM) at the virtual address,
+    // so we translate to physical and read through the dmap instead
+    uint64_t ptrs[2];
+    copyout(ptrs, offsets.kernel_pmap_store + 32, sizeof(ptrs));
+    uint64_t dmap = ptrs[0] - ptrs[1];
+    uint64_t cr3 = ptrs[1];
+
+    // verify virt2phys works on a known .text address
+    uint64_t test_phys = virt2phys(landmark, 0, dmap, cr3);
+    if(test_phys == (uint64_t)-1)
+    {
+        notify("ktext dump FAILED: virt2phys");
+        return;
+    }
+
     // diagnostic notification
     {
         char msg[128];
         char* p = msg;
         append_str(&p, "ktext: sz=");
         fmt_hex64(&p, text_size);
+        append_str(&p, " dmap=");
+        fmt_hex64(&p, dmap);
         *p = 0;
         notify(msg);
     }
@@ -480,6 +498,7 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
+    // read .text via dmap (physical) to bypass execute-only virtual mapping
     size_t chunk_sz = 0x10000; // 64KB
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
@@ -487,10 +506,19 @@ static void dump_ktext_to_usb(void)
     int err = 0;
     while(total < text_size)
     {
+        uint64_t vaddr = text_start + total;
+        uint64_t phys_limit;
+        uint64_t phys = virt2phys(vaddr, &phys_limit, dmap, cr3);
+        if(phys == (uint64_t)-1) { err = 3; break; }
+
+        // read up to end of this physical page, but max chunk_sz
+        uint64_t page_avail = phys_limit - phys;
+        uint64_t remaining = text_size - total;
         size_t to_read = chunk_sz;
-        if(text_size - total < to_read)
-            to_read = text_size - total;
-        ssize_t got = copyout(buf, text_start + total, to_read);
+        if(page_avail < to_read) to_read = page_avail;
+        if(remaining < to_read) to_read = remaining;
+
+        ssize_t got = copyout(buf, dmap + phys, to_read);
         if(got <= 0) { err = 1; break; }
         if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
         total += to_read;
@@ -500,7 +528,12 @@ static void dump_ktext_to_usb(void)
 
     if(err)
     {
-        notify("ktext dump FAILED: I/O error");
+        char msg[64];
+        char* p = msg;
+        append_str(&p, "ktext dump FAILED: I/O err=");
+        fmt_dec(&p, err);
+        *p = 0;
+        notify(msg);
         return;
     }
 
@@ -521,6 +554,7 @@ static void dump_ktext_to_usb(void)
         append_str(&p, "text_end=");   fmt_hex64(&p, text_end);   *p++ = '\n';
         append_str(&p, "text_size=");  fmt_dec(&p, text_size);    *p++ = '\n';
         append_str(&p, "kdata_base="); fmt_hex64(&p, kdata_base); *p++ = '\n';
+        append_str(&p, "dmap_base=");  fmt_hex64(&p, dmap);       *p++ = '\n';
         append_str(&p, "fw_version="); fmt_hex64(&p, fwver);      *p++ = '\n';
         *p = 0;
 
