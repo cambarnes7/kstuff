@@ -361,22 +361,6 @@ void build_uelf_cr3(uint64_t uelf_cr3, void* uelf_base[2], uint64_t uelf_virt_ba
 
 /* kernel .text dump to USB */
 
-static uint64_t walk_pte(uint64_t vaddr, uint64_t dmap, uint64_t cr3)
-{
-    uint64_t pml = cr3;
-    for(int shift = 39; shift >= 12; shift -= 9)
-    {
-        uint64_t entry;
-        copyout(&entry, dmap + pml + (((vaddr >> shift) & 0x1ff) << 3), 8);
-        if(!(entry & 1))
-            return 0;
-        if((entry & 0x80) || shift == 12)
-            return entry;
-        pml = entry & ((1ull << 52) - (1ull << 12));
-    }
-    return 0;
-}
-
 static void append_str(char** pp, const char* s)
 {
     char* p = *pp;
@@ -430,7 +414,9 @@ static void dump_ktext_to_usb(void)
 
     notify("Dumping kernel .text to USB...");
 
-    // compute .text range from known offsets (no page table walking)
+    // compute .text range directly from known offsets
+    // all addresses between the most negative offset and kdata_base are
+    // proven mapped -- kstuff already patches/calls them during init
     uint64_t candidates[] = {
         offsets.cpu_switch,
         offsets.doreti_iret,
@@ -454,24 +440,10 @@ static void dump_ktext_to_usb(void)
         return;
     }
 
-    // round down to 2MB boundary and add 2MB margin
-    uint64_t text_start = (landmark & ~0x1FFFFFull) - 0x200000;
+    // page-align the most negative known offset -- no margin beyond known range
+    uint64_t text_start = landmark & ~0xFFFull;
     uint64_t text_end = kdata_base;
     uint64_t text_size = text_end - text_start;
-    if(text_size > 0x2000000) // cap at 32MB
-    {
-        text_start = kdata_base - 0x2000000;
-        text_size = 0x2000000;
-    }
-
-    // read dmap/cr3 for optional per-chunk page validation
-    uint64_t ptrs[2];
-    copyout(ptrs, offsets.kernel_pmap_store + 32, sizeof(ptrs));
-    uint64_t dmap = ptrs[0] - ptrs[1];
-    uint64_t cr3 = ptrs[1];
-
-    // test if walk_pte works on a known-good address
-    int pte_works = (walk_pte(landmark, dmap, cr3) != 0);
 
     // diagnostic notification
     {
@@ -479,8 +451,6 @@ static void dump_ktext_to_usb(void)
         char* p = msg;
         append_str(&p, "ktext: sz=");
         fmt_hex64(&p, text_size);
-        append_str(&p, " pte=");
-        *p++ = pte_works ? '1' : '0';
         *p = 0;
         notify(msg);
     }
@@ -512,7 +482,6 @@ static void dump_ktext_to_usb(void)
 
     size_t chunk_sz = 0x10000; // 64KB
     char* buf = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
-    char* zeros = mmap(0, chunk_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 
     uint64_t total = 0;
     int err = 0;
@@ -521,27 +490,13 @@ static void dump_ktext_to_usb(void)
         size_t to_read = chunk_sz;
         if(text_size - total < to_read)
             to_read = text_size - total;
-
-        uint64_t addr = text_start + total;
-        int mapped = 1;
-        if(pte_works && !walk_pte(addr, dmap, cr3))
-            mapped = 0;
-
-        if(mapped)
-        {
-            ssize_t got = copyout(buf, addr, to_read);
-            if(got <= 0) { err = 1; break; }
-            if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
-        }
-        else
-        {
-            if(write(fd, zeros, to_read) != (ssize_t)to_read) { err = 2; break; }
-        }
+        ssize_t got = copyout(buf, text_start + total, to_read);
+        if(got <= 0) { err = 1; break; }
+        if(write(fd, buf, got) != (ssize_t)got) { err = 2; break; }
         total += to_read;
     }
     close(fd);
     munmap(buf, chunk_sz);
-    munmap(zeros, chunk_sz);
 
     if(err)
     {
@@ -566,9 +521,6 @@ static void dump_ktext_to_usb(void)
         append_str(&p, "text_end=");   fmt_hex64(&p, text_end);   *p++ = '\n';
         append_str(&p, "text_size=");  fmt_dec(&p, text_size);    *p++ = '\n';
         append_str(&p, "kdata_base="); fmt_hex64(&p, kdata_base); *p++ = '\n';
-        append_str(&p, "dmap_base=");  fmt_hex64(&p, dmap);       *p++ = '\n';
-        append_str(&p, "cr3=");        fmt_hex64(&p, cr3);        *p++ = '\n';
-        append_str(&p, "pte_works=");  *p++ = pte_works ? '1' : '0'; *p++ = '\n';
         append_str(&p, "fw_version="); fmt_hex64(&p, fwver);      *p++ = '\n';
         *p = 0;
 
