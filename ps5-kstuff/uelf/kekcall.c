@@ -7,6 +7,7 @@
 #include "traps.h"
 #include "utils.h"
 #include "uexec.h"
+#include "hv_probe.h"
 
 extern char syscall_after[];
 extern char doreti_iret[];
@@ -49,7 +50,10 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     {
         return rdmsr(args[RDI], &args[RAX]) ? 0 : EFAULT;
     }
-    //nr 4 reserved for wrmsr
+    else if(nr == 4) //wrmsr
+    {
+        return hv_probe_msr_write(args[RDI], args[RSI]);
+    }
     else if(nr == 5) //remote syscall
     {
         uint64_t stack_frame[16] = {(uint64_t)doreti_iret, MKTRAP(TRAP_KEKCALL, 2)};
@@ -64,6 +68,25 @@ int handle_kekcall(uint64_t* regs, uint64_t* args, uint32_t nr)
     }
     else if(nr == 11)
         return handle_uexec(regs, args);
+    else if(nr == 30) //hv probe: read CR
+    {
+        args[RAX] = hv_probe_cr_read(args[RDI]);
+        return 0;
+    }
+    else if(nr == 31) //hv probe: write CR + readback
+    {
+        uint64_t readback;
+        int err = hv_probe_cr_write_readback(args[RDI], args[RSI], &readback);
+        args[RAX] = readback;
+        return err;
+    }
+    else if(nr == 32) //hv probe: wrmsr + readback
+    {
+        uint64_t readback;
+        int err = hv_probe_msr_write_readback(args[RDI], args[RSI], &readback);
+        args[RAX] = readback;
+        return err;
+    }
     else if(nr == 0xffffffff)
     {
         args[RAX] = 0;
