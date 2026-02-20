@@ -182,7 +182,7 @@ class GDB:
             try:
                 self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
                 with stdio:
-                    self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
+                    self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
                 output = self._read_until(token.encode('ascii')+b'\n')
                 if b'could not connect' not in output and b'Connection refused' not in output and b'Connection timed out' not in output and b'Operation timed out' not in output:
                     print('done')
