@@ -288,33 +288,80 @@ HV API from the outside.
 
 ---
 
-## Implementation: Safe HV Probe Payload
+## Implementation: hv_probe.py
 
-The payload should run AFTER kstuff uelf is installed (for #GP handler coverage).
-Built with PS5 Payload SDK, sent via idlesauce host to 192.168.0.88.
+**Tool:** `ps5-kstuff/porting_tool/hv_probe.py`
 
-### Payload structure:
+This is a concrete Python tool that plugs into the existing porting_tool
+infrastructure. No new payload required — it uses the same gdb_rpc/r0gdb
+mechanism that already works.
+
+### Step 1: Find the HV boundary
+
+```python
+import hv_probe
+result = hv_probe.find_hv_boundary(gdb, r0gdb, symbols, kdata_base)
 ```
-1. Connect socket back to Mac at 192.168.0.99
-2. Phase 1: Dump full guest page table hierarchy → send to Mac
-3. Phase 2: Scan kdata dump for HV artifacts → send results to Mac
-4. Phase 3: Trace key code paths → send traces to Mac
-5. Phase 4: Probe MSRs (with #GP safety net) → send results to Mac
-6. Phase 5: Probe VMMCALLs → send results to Mac
+
+This traces mmap+mlock of a signed SELF using `fix_mmap_self` as the trace
+program. Since `fix_mmap_self` only patches 2 addresses, every instruction
+inside sceSblServiceMailbox gets recorded — including the VMMCALL or MMIO
+that crosses into the HV.
+
+The tool identifies the HV boundary by looking for:
+- **#VMEXIT gaps**: consecutive frames where RIP jumps >15 bytes but the
+  control flow isn't a call/ret. This happens because VMMCALL causes #VMEXIT
+  which preempts #DB, so the trap for the VMMCALL instruction is "eaten."
+- **Polling loops**: repeated short instruction sequences (spin-wait after
+  MMIO doorbell write)
+- **Subcall analysis**: if VMMCALL is in a helper function called by
+  sceSblServiceMailbox, the tool finds it there too.
+
+Output: VMMCALL address, register state before/after, calling convention.
+
+### Step 2: Probe the mailbox interface
+
+```python
+handle = result['mailbox_handle']
+hv_probe.probe_mailbox_commands(gdb, r0gdb, symbols, kdata_base, handle)
 ```
+
+This calls `sceSblServiceMailbox` directly through `r0gdb_kfncall` with
+crafted 128-byte messages. For each command ID:
+1. Allocates kernel buffer, writes command ID at offset 0
+2. Calls `sceSblServiceMailbox(handle, buf, buf)` through the kernel wrapper
+3. Reads back the response (status at offset 4, full 128 bytes)
+
+This is safe because:
+- The kernel wrapper handles VMMCALL setup/teardown properly
+- The HV is designed to receive mailbox messages
+- Invalid command IDs should return error codes, not crash
+
+### Step 3: Deep probe known commands
+
+```python
+hv_probe.probe_known_commands(gdb, r0gdb, symbols, kdata_base, handle)
+```
+
+Tests specific command IDs from Byepervisor research (SM_VERIFY_HEADER,
+SM_LOAD_SELF_SEGMENT, SM_DECRYPT_SELF_BLOCK, etc.) to map which commands
+the HV recognizes and what error codes it returns.
 
 ### What this gives us:
-- Complete physical memory map of the guest
-- .text vs .data physical address classification
-- All function pointers in .data (indirect .text address map)
-- EFER/SVM configuration (if readable)
-- MSRPM bitmap (reversed from #GP probing)
-- Hypercall interface behavior
-- Traced instruction-by-instruction disassembly of key kernel functions
+- The VMMCALL/MMIO instruction address and register convention
+- Which mailbox commands the HV accepts (command enumeration)
+- Error codes for invalid/malformed commands
+- Response data for valid commands
+- The handle value needed to invoke sceSblServiceMailbox
+- Full instruction trace of sceSblServiceMailbox internals
 
-This is enough to understand the HV's interface and constraints, identify potential
-vulnerabilities, and plan a targeted HV compromise — all without a single kernel
-panic.
+### What to do with the results:
+1. **Command fuzzing**: for commands that accept arguments, vary the argument
+   fields and look for crashes, unexpected responses, or data leaks
+2. **Argument overflow**: test oversized/undersized messages
+3. **Race conditions**: call multiple commands concurrently from different CPUs
+4. **State confusion**: call commands out of expected order
+5. **Handle manipulation**: try different RDI handle values
 
 ---
 
