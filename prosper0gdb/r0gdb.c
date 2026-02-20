@@ -550,6 +550,16 @@ void r0gdb_trace(size_t trace_size)
         copyin(uretframe, uretframe_for_trace, sizeof(uretframe_for_trace));
         tracing = 1;
     }
+    // free old trace buffer to prevent memory accumulation
+    if(trace_base && trace_end > trace_base)
+    {
+        size_t old_size = trace_end - trace_base;
+        munlock((void*)trace_base, old_size);
+        munmap((void*)trace_base, old_size);
+        trace_base = 0;
+        trace_start = 0;
+        trace_end = 0;
+    }
     char* tracebuf = 0;
     if(trace_size)
         tracebuf = mmap(0, trace_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);

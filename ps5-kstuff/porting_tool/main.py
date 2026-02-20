@@ -87,43 +87,49 @@ def derive_symbols(*names):
         return f
     return inner
 
+KDUMP_CACHE = os.path.join(os.path.dirname(sys.argv[1]) or '.', '.kdata_cache.bin')
+
+def _kdump_cache_path():
+    if len(sys.argv) == 5:
+        return sys.argv[4]
+    return KDUMP_CACHE
+
 @retry_on_error
 def dump_kernel():
-    if len(sys.argv) == 5 and os.path.exists(sys.argv[4]):
-        with open(sys.argv[4], 'rb') as file:
+    cache_path = _kdump_cache_path()
+    if os.path.exists(cache_path):
+        with open(cache_path, 'rb') as file:
             data = file.read()
-        if int.from_bytes(data[8:16], 'little') == len(data) - 16:
+        if len(data) >= 16 and int.from_bytes(data[8:16], 'little') == len(data) - 16:
+            print('using cached kernel dump from %s'%cache_path)
             return data[16:], int.from_bytes(data[:8], 'little')
     gdb.use_r0gdb(R0GDB_FLAGS)
     kdata_base = gdb.ieval('kdata_base')
     gdb.eval('offsets.allproc = '+ostr(kdata_base + get_symbol('allproc')))
     if not gdb.ieval('rpipe'): gdb.eval('r0gdb_init_with_offsets()')
     local_buf = bytearray()
+    chunk_size = 65536
     with gdb_rpc.BlobReceiver(gdb, local_buf, 'dumping kdata') as addr:
         remote_fd = gdb.ieval('r0gdb_open_socket("%s", %d)'%addr)
-        remote_buf = gdb.ieval('malloc(1048576)')
+        remote_buf = gdb.ieval('malloc(%d)'%chunk_size)
         one_second = gdb.ieval('(void*)(uint64_t[2]){1, 0}')
         total_sent = 0
         while total_sent < (134 << 20):
-            chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kdata_base+total_sent, min(1048576, (134 << 20) - total_sent)))
+            chk0 = gdb.ieval('copyout(%d, %d, %d)'%(remote_buf, kdata_base+total_sent, min(chunk_size, (134 << 20) - total_sent)))
             if chk0 <= 0: break
             assert not gdb.ieval('r0gdb_sendall(%d, %d, %d)'%(remote_fd, remote_buf, chk0))
             total_sent += chk0
-            #offset = 0
-            #while offset < chk0:
-            #    chk = gdb.ieval('(int)write(%d, %d, %d)'%(remote_fd, remote_buf+offset, chk0-offset))
-            #    assert chk > 0
-            #    offset += chk
-            #    total_sent += chk
         # this loop is to detect panics while dumping
         while len(local_buf) != total_sent:
             gdb.eval('(int)nanosleep(%d)'%one_second)
         gdb.eval('(int)close(%d)'%remote_fd)
-    if len(sys.argv) == 5:
-        with open(sys.argv[4], 'wb') as file:
-            file.write(kdata_base.to_bytes(8, 'little'))
-            file.write(len(local_buf).to_bytes(8, 'little'))
-            file.write(local_buf)
+        gdb.eval('munmap(%d, %d)'%(remote_buf, chunk_size))
+    # always cache the kernel dump to avoid re-dumping on retry
+    with open(cache_path, 'wb') as file:
+        file.write(kdata_base.to_bytes(8, 'little'))
+        file.write(len(local_buf).to_bytes(8, 'little'))
+        file.write(local_buf)
+    print('kernel dump cached to %s'%cache_path)
     return bytes(local_buf), kdata_base
 
 def get_kernel(_cache=[]):
