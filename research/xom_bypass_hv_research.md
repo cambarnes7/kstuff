@@ -1,413 +1,342 @@
 # PS5 XOM Bypass & Hypervisor Structure Research
 ## Target: FW 4.03 | Tools: kstuff + idlesauce/umtx2 jailbreak
 
-### The Problem
+---
 
-On PS5 FW 4.03, after umtx2 jailbreak we have:
-- **Kernel arbitrary read/write** (via pktopts/pipe primitives in r0gdb.c)
-- **Kernel .data is fully readable AND writable** (no .data write protection until FW 6.00)
-- **Kernel .text is XOM-protected** — any read attempt triggers a nested page fault, the hypervisor catches it, and the system panics
-- **No decrypted firmware dump available**
+## The Hard Truth About XOM
 
-The hypervisor enforces XOM through AMD SVM nested page tables (NPT). The xotext
-bit (bit 58) in nested PTEs marks kernel .text as execute-only. The HV also intercepts
-CR0/CR4 writes and blocks EFER bit 16 (xotext enable), bit 12 (SVME), and bit 11 (NXE)
-changes via masked EFER writes.
+**Reading kernel .text = kernel panic. Every single time. No exceptions.**
 
-We need to understand the hypervisor structure to eventually break it, **without
-triggering kernel panics**.
+XOM is enforced by the hypervisor through AMD SVM nested page tables (NPT). The
+xotext bit (bit 58) in nested PTEs marks kernel .text as execute-only. When the CPU
+executes a memory LOAD instruction targeting an XOM-protected physical page, the nested
+page table walk fails, a #NPF (nested page fault) fires, the HV catches it, and the
+system panics. This happens for:
+
+- `kread8()` on .text addresses — **PANIC**
+- `copyout()` on .text addresses — **PANIC**
+- `rep movsb` (used by kelf.asm `cmpb` macro) on .text — **PANIC**
+- DMAP reads of .text physical addresses — **PANIC**
+- ANY CPU load instruction targeting XOM physical pages — **PANIC**
+
+**Critically: #NPF is handled by the HV, NOT the guest.** The guest kernel cannot
+install a fault handler that catches nested page faults. There is no try/catch for
+NPF. If the HV decides to panic, you panic. Period.
 
 ---
 
-## What kstuff Already Gives Us (Panic-Free)
+## What Does NOT Panic (Proven by kstuff)
 
-### 1. Kernel .data dump (r0gdb `copyout`)
-`prosper0gdb/r0gdb.c:134` — `copyout()` can bulk-copy kernel .data to userspace.
-The porting_tool (`main.py:78-114`) dumps ~134 MB of kernel .data this way. This
-region contains:
-- **Function pointer tables** (sysents, sysents_ps4) pointing into .text
-- **IDT entries** — 256 interrupt descriptors, each containing .text handler addresses
-- **GDT/TSS arrays** — processor descriptor tables
-- **PCPU array** — per-CPU data structures
-- **Hypercall-related structures** — on FW ≤2.70 the jump table was in .data; on 4.03
-  the HV is separate but there may still be guest-side data structures
-- **kernel_pmap_store** — the kernel page map, containing physical address mappings
-- **QA flags** — shared between HV and guest kernel
-- **String references** — xrefs to known strings leak structure offsets
+These operations have been executed thousands of times by kstuff/porting_tool without
+any panics:
 
-### 2. Single-step execution tracing (r0gdb trace)
-`prosper0gdb/r0gdb.c:531` — `r0gdb_trace()` sets up the TF (trap flag) to single-step
-kernel instructions. At each step it captures a full frame:
-```
-{rip, cs, eflags, rsp, ss, rax, rcx, rdx, rbx, pad, rbp, rsi, rdi, r8-r15}
-```
-This is the **core XOM bypass technique**: the CPU EXECUTES each instruction (allowed
-by XOM), and the debug trap captures the state AFTER each instruction. By observing:
-- **RIP delta** → instruction length
-- **Register changes** → instruction semantics
-- **RSP changes** → calls/returns/pushes/pops
-- **Memory side effects** (via subsequent kread8) → stores
+### 1. Reading kernel .data
+`kread8()` and `copyout()` on kernel .data addresses work perfectly. The NPT maps
+.data pages as readable. kstuff dumps ~134MB of kernel .data this way.
 
-You effectively disassemble code **through execution** without ever reading it.
+**Proven at:** `prosper0gdb/r0gdb.c:56` (kread8), `prosper0gdb/r0gdb.c:134` (copyout)
+**Used by:** porting_tool `dump_kernel()` at `main.py:78-114`
 
-### 3. Register/MSR/CR access (r0gdb)
-- `r0gdb_rdmsr(ecx)` / `r0gdb_wrmsr(ecx, value)` — read/write MSRs
-- `r0gdb_read_cr3()` / `r0gdb_write_cr3()` — read/write CR3
-- `r0gdb_read_dbregs()` / `r0gdb_write_dbregs()` — hardware debug registers
-- `run_in_kernel(regs)` — execute arbitrary kernel instructions with controlled registers
+### 2. Walking guest page tables through DMAP
+The DMAP (direct map) gives kernel virtual addresses for physical memory. Guest page
+table pages are stored in physical memory that IS mapped readable in the NPT. Reading
+them through DMAP is safe.
 
-### 4. Instrumented tracing (trace_prog callbacks)
-`prosper0gdb/r0gdb.c:646` — `r0gdb_instrument()` installs a custom callback that
-fires at every single-stepped instruction. The porting_tool uses this extensively:
-- `trace_skip_scheduler_only` — trace syscalls skipping context switches
-- `trace_calls` — trace function call trees
-- `do_jprog` — programmable trace with register injection
-- `leak_rep_movsq` — find gadgets by observing execution side effects
+**Proven at:** `ps5-kstuff/main.c:262` (virt2phys reads DMAP+pml)
+**Proven at:** `ps5-kstuff/main.c:327` (reads entire PML4 through DMAP)
+**Used by:** porting_tool `virt2phys()` at `main.py:289`
+
+### 3. Reading CR3
+`r0gdb_read_cr3()` executes `mov rax, cr3` in kernel mode. The HV either doesn't
+intercept CR3 reads or returns the guest CR3. This works.
+
+**Proven at:** `prosper0gdb/r0gdb.c:483`
+**Used by:** `ps5-kstuff/main.c:258`, `main.c:325`
+
+### 4. Reading/writing MSR 0xC0000084 (SFMASK)
+The porting_tool reads and writes this MSR during trace setup. It is NOT in the HV's
+MSRPM protection bitmap (or is allowed to pass through).
+
+**Proven at:** `prosper0gdb/r0gdb.c:538`
+
+### 5. Single-step tracing kernel .text
+Setting the TF (trap flag) and executing kernel code one instruction at a time is
+safe. The CPU EXECUTES the instruction (allowed by XOM — execute is permitted), then
+the debug trap captures the register state AFTER each instruction. No read of .text
+memory occurs.
+
+**Proven at:** Entire porting_tool offset discovery system
+**Example:** `main.py:357-404` finds `rdmsr_start`, `pop_all_iret`, `justreturn`
+**Example:** `main.py:557-581` traces `cpu_switch` call tree
+
+### 6. Reading/writing debug registers
+Hardware debug registers (DR0-DR7) are accessible through r0gdb.
+
+**Proven at:** `prosper0gdb/r0gdb.c:424-480`
+
+### 7. Kernel function calls via run_in_kernel
+Executing kernel instructions with controlled register values. The CPU executes
+the instruction (not a read), so XOM doesn't fire.
+
+**Proven at:** `prosper0gdb/r0gdb.c:280` (run_in_kernel)
 
 ---
 
-## Strategies to Research the Hypervisor (Panic-Free)
+## What MIGHT Panic (Unproven on FW 4.03)
 
-### Strategy 1: Mine Kernel .data for HV Artifacts
-**Risk: NONE — purely reads .data**
+### MSR reads of SVM-specific registers
+The HV constructs an MSRPM (MSR Protection Map) bitmap that controls which MSRs
+trigger #VMEXIT on access. MSR 0xC0000084 is proven safe. Others are unknown.
 
-The kernel .data section contains a wealth of information about the hypervisor:
+**If protected:** rdmsr triggers #VMEXIT → HV injects #GP into guest.
+- If kstuff's uelf layer is running (int13_handler installed): #GP is caught cleanly
+- If running in raw r0gdb mode (no int13_handler): stock kernel #GP handler runs
+  in an unexpected context → likely crash
 
-**a) Hypercall table pointers**
-The PS5 has only ~17 hypercalls (VMMCALL 0x0-0x10). On FW 4.03, the HV is a separate
-component, but the guest-side dispatch table or function pointers may still reside in
-kernel .data. Scan for:
-- Arrays of 17 code pointers (values in kernel .text range, i.e., 0xFFFFFFFF8XXXXXXX)
-- VMMCALL wrapper functions referenced from sysent or other dispatch tables
-- Strings like "vmmcall", "hypercall", "hv_" in the .data region
+**Risk mitigation:** Only attempt SVM MSR reads AFTER kstuff uelf is fully installed,
+where the `int13_handler` at `uelf/main.c:122` catches #GP. This way a protected
+MSR read fails gracefully instead of panicking.
 
-**b) VMCB pointer / VM_HSAVE_PA**
-The VMCB (Virtual Machine Control Block) is a 4KB page that controls the VM. Its
-physical address may be referenced in kernel .data. Look for:
-- The VM_HSAVE_PA MSR (0xC0010117) — read it via `r0gdb_rdmsr(0xC0010117)` to get
-  the VMCB host save area physical address
-- Pointers to page-aligned physical addresses in low memory (VMCB is typically in
-  low physical memory)
-
-**c) QA flags location**
-The QA flags are shared between HV and guest kernel. On Byepervisor, setting the SL
-(System Level) debug flag causes the HV to skip setting the xotext bit on NPT entries
-during initialization. Even on FW 4.03 (where the sleep/resume trick may not work the
-same way), finding the QA flags structure is valuable:
-- Search .data for known flag patterns
-- Look for references near HV initialization code paths
-
-**d) kernel_pmap_store → NPT root**
-The kernel_pmap_store (found by the porting_tool at `main.py:248`) contains the
-physical address mapping for kernel virtual addresses. From this you can:
-- Calculate the direct-map (DMAP) base address
-- Walk the guest page tables to find all .text/.data regions
-- Look for NPT-related pointers stored alongside kernel pmap data
-
-**e) IDT handler analysis**
-All 256 IDT entries are in .data and point into .text. These are extremely valuable:
-- IDT[1] = #DB (debug exception) — the core of r0gdb
-- IDT[6] = #UD (undefined opcode)
-- IDT[13] = #GP (general protection fault)
-- IDT[14] = #PF (page fault) — triggers on XOM violation before HV intercept
-- IDT[244+] = system-specific handlers (LAPIC, timers, etc.)
-Each IDT entry leaks a .text address. Combined with tracing, you can map the entire
-interrupt handling flow.
-
-### Strategy 2: Blind Disassembly via Single-Step Tracing
-**Risk: NONE — only executes code (allowed by XOM), never reads it**
-
-This is the most powerful technique already proven by the porting_tool:
-
-**a) Instruction length oracle**
-Single-step from a known address. `RIP_after - RIP_before = instruction_length`.
-x86 instruction lengths range from 1-15 bytes. Combined with register deltas, this
-often uniquely identifies the instruction.
-
-**b) Controlled-input execution**
-Set specific register values via r0gdb, execute one instruction, observe changes:
+**MSRs we want to read:**
 ```
-Example from porting_tool main.py:614-618:
-  Set rdi = rsp, {int}(rsp+0xea) = 123456789, ebx = 987654321
-  Execute instruction at resumectx+192
-  Check: {int}(rsp+0xea) == 1111111110
-  → This proves the instruction is "add [rdi+0xea], ebx"
+0xC0000080 - EFER (might be readable - guest needs to see its own EFER)
+0xC0010114 - VM_CR (SVM config - likely MSRPM-protected)
+0xC0010117 - VM_HSAVE_PA (host save area - almost certainly MSRPM-protected)
 ```
-By controlling inputs and observing outputs, you can determine instruction semantics
-for ANY kernel .text address without reading it.
 
-**c) Full function tracing**
-Trace an entire function call tree:
+### DMAP reads of unknown physical address ranges
+The DMAP maps physical RAM to kernel virtual space. For .data physical pages, the
+NPT allows reads (proven). For .text physical pages, the NPT has xotext set (PANIC).
+For physical pages belonging to the HV itself, we don't know — they might be:
+- NPT-unmapped entirely → #NPF → HV handler → probably panic
+- NPT-mapped with xotext → #NPF → panic
+- NPT-mapped readable → safe (but this would be a HV design flaw)
+
+**There is NO safe way to test this from the guest.** #NPF cannot be caught.
+
+---
+
+## Safe Strategy: What We Can Actually Learn Without Panicking
+
+### Phase 1: Full Guest Page Table Dump (ZERO RISK)
+
+Walk the entire guest page table hierarchy through DMAP. This is proven safe and
+gives us:
+
+**a) Complete physical memory map**
+```
+CR3 → PML4 (512 entries)
+  → Each PDPT (512 entries)
+    → Each PD (512 entries)
+      → Each PT (512 entries) or 2MB/1GB huge pages
+```
+For each final entry, extract:
+- Physical address
+- Present bit (0), R/W bit (1), U/S bit (2), NX bit (63)
+- Page size (4KB, 2MB, 1GB)
+
+**b) Identify .text vs .data physical ranges**
+We know .text virtual addresses from IDT entries and sysent pointers (readable from
+.data). Use `virt2phys()` to translate them to physical addresses. This tells us
+which physical address ranges to NEVER try to DMAP-read.
+
+**c) DMAP coverage analysis**
+Walk the DMAP's own PML4/PDPT/PD/PT entries to see exactly which physical address
+range the DMAP covers. Any HV physical pages outside this range are completely
+inaccessible (no guest mapping exists). Any HV pages inside this range but with
+xotext in the NPT will panic on read.
+
+**d) Physical address gap analysis**
+Compare the full set of physical addresses referenced by guest page tables against
+the total DMAP-covered range. Gaps might indicate HV-reserved physical regions.
+
+### Phase 2: Exhaustive .data Mining (ZERO RISK)
+
+Scan the entire kernel .data dump for HV-related artifacts:
+
+**a) Function pointers pointing into .text**
+Every 8-byte-aligned value in .data that falls in the kernel .text virtual address
+range (0xFFFFFFFF80XXXXXX to 0xFFFFFFFF8XXXXXXX) is a .text pointer. Catalog ALL
+of them. These form a map of what functions the kernel references, which includes:
+- Syscall handler table (sysents) — already known
+- Interrupt handlers (IDT) — already known
+- Hypercall wrappers (VMMCALL dispatch)
+- Callback tables, vtables, function pointer arrays
+
+**b) Hypercall-related structures**
+Search .data for patterns related to VMMCALL dispatch. On FW ≤2.70 the hypercall
+jump table was directly in .data. On FW 4.03 it may have moved, but there should
+still be guest-side structures that reference the hypercall interface:
+- Array of exactly 17 function pointers (the 17 known hypercalls)
+- Pointers near VMMCALL instruction addresses
+- Structures containing both a function pointer and an integer ID (0x00-0x10)
+
+**c) QA flags structure**
+The QA flags are shared between HV and guest kernel. They're in .data (writable on
+FW 4.03). Look for:
+- A flags structure that contains bit fields
+- References near known HV initialization code paths
+- Values that look like debug/QA configuration
+
+**d) VMCB / SVM pointers**
+Even though the HV is separate on FW 4.03, the kernel may store references to
+SVM-related structures in .data:
+- Physical address values (< 2^39, page-aligned) that don't correspond to known
+  kernel physical pages — could be VMCB physical address
+- The VMCB is 4KB-aligned, so look for page-aligned physical addresses in .data
+
+**e) String scanning**
+Look for strings in .data that reveal HV-related functionality:
+- "vmmcall", "hypercall", "hv_", "svm", "npt", "vmcb"
+- "xotext", "xom", "execute"
+- "qa_flag", "sl_flag", "debug"
+- AMD-specific strings
+
+### Phase 3: Blind Disassembly of Key Code Paths (ZERO RISK)
+
+Use single-step tracing to understand kernel code without reading it:
+
+**a) Trace VMMCALL execution**
+If we find a hypercall wrapper (from Phase 2 .data mining), trace through it:
+1. Set registers for a known-safe hypercall (e.g., CPUID query)
+2. Single-step until VMMCALL instruction
+3. VMMCALL exits to HV, HV processes it, returns to guest
+4. Observe registers after VMMCALL return — shows HV return values
+5. The RIP values before VMMCALL give us the wrapper code structure
+6. The RIP after VMMCALL shows where the HV returns to
+
+This is safe because VMMCALL is an intentional HV entry point — the HV expects it.
+
+**b) Trace interrupt handlers**
+The IDT entries (in .data, readable) give us entry points for all 256 interrupt
+handlers. Trace them to understand:
+- What #PF (IDT[14]) does — the page fault handler's logic
+- What #GP (IDT[13]) does — how the kernel handles protection faults
+- What #DB (IDT[1]) does — the debug handler
+- These reveal the kernel's internal flow and structure offsets
+
+**c) Trace known system calls**
+The porting_tool already traces syscalls. Extend this to trace:
+- mmap/mprotect — understand page table manipulation code
+- ioctl — understand device interaction, potentially GPU commands
+- Any syscall that might interact with the HV internally
+
+**d) Instruction semantics recovery**
+For any .text address found as a pointer in .data, recover the instruction at that
+address by:
+1. Set controlled register values
+2. Execute one instruction at the target address
+3. Observe register/memory changes
+4. Deduce the instruction
+
+Example (already done by porting_tool, main.py:614-632):
 ```python
-# From porting_tool: trace a syscall to find cpu_switch
-trace = Trace(r0gdb.trace('trace_calls', 'nanosleep', ...))
-for i in range(1, len(trace)):
-    if trace.is_jump(i-1) and trace[i].rsp not in range(...):
-        # Found a function call boundary
-```
-This builds a call graph of kernel execution without reading any code.
-
-**d) Systematic sweep of .text region**
-Given that we know .text addresses from .data pointers (IDT entries, sysent handlers,
-etc.), we can:
-1. Start at each known .text address
-2. Single-step through the function
-3. Record all executed paths
-4. Build a map of the entire reachable code
-
-### Strategy 3: VMMCALL Probing (Hypercall Fuzzing)
-**Risk: LOW — worst case is a clean VM exit, not a panic**
-
-The PS5 has ~17 documented hypercalls. Using `run_in_kernel()` we can:
-
-**a) Enumerate hypercall interface**
-```c
-struct regs r = {0};
-r.rip = <address_of_vmmcall_gadget>;  // find via trace
-r.rax = hypercall_number;  // 0x0 through 0x10
-r.rdi = arg1;
-r.rsi = arg2;
-// etc.
-run_in_kernel(&r);
-// Check r.rax for return value, other regs for outputs
+# Set rdi = rsp, write known value to [rsp+0xea], set ebx = known value
+# Execute instruction at target
+# Check if [rsp+0xea] changed → proves it's "add [rdi+0xea], ebx"
 ```
 
-**b) Known PS5 hypercalls to probe:**
-- 0x00-0x03: Message/loading operations
-- 0x04: HV_SET_CPUID_PS4 (the one Byepervisor hijacks on ≤2.50)
-- 0x05: CPUID configuration
-- 0x06-0x0C: IOMMU management
-- 0x0D: TMR violation handling
-- 0x0E-0x10: Multi-processing operations
+### Phase 4: Safe MSR Probing (LOW RISK — with #GP handler)
 
-Each call's return values and side effects reveal HV internal behavior.
+After kstuff uelf is fully installed (int13_handler active), probe MSRs:
 
-**c) VMMCALL gadget location**
-Find a `vmmcall; ret` sequence by tracing code paths that are known to make
-hypercalls (IOMMU setup, CPUID emulation, etc.). The porting_tool's trace
-mechanism can identify the exact address.
+**a) Read EFER (0xC0000080)**
+This is likely readable — the guest needs to see EFER for normal operation. It tells
+us:
+- Bit 12: SVME — is SVM enabled? (should be 1)
+- Bit 16: xotext/nda feature — is the custom AMD xotext feature enabled?
+- Bit 11: NXE — NX bit enabled?
 
-### Strategy 4: AMD SVM MSR/CR Reconnaissance
-**Risk: NONE for reads; careful with writes**
+**b) Probe VM_CR (0xC0010114)**
+May be MSRPM-protected. If #GP is caught by int13_handler, we know it's protected
+(which itself is information). If readable:
+- Bit 3: LOCK — SVM config locked
+- Bit 4: SVMDIS — SVM disabled
 
-AMD SVM exposes significant HV configuration through MSRs:
+**c) Probe VM_HSAVE_PA (0xC0010117)**
+Almost certainly MSRPM-protected. The #GP catch tells us it's protected. If somehow
+readable, it gives us the physical address of the host save area (near the VMCB).
 
-**Critical MSRs to read via r0gdb_rdmsr():**
+**d) Systematic MSR enumeration**
+Iterate through all known AMD MSRs, attempting rdmsr on each. With int13_handler
+catching #GP, this is safe. Result: a complete map of which MSRs the guest can read
+(MSRPM bitmap reverse-engineered from the guest side).
+
+### Phase 5: VMMCALL Probing (LOW RISK)
+
+Issue VMMCALL with different function numbers and observe behavior:
+
+**a) Find VMMCALL gadget**
+Trace a known hypercall path to find the address of the `vmmcall` instruction.
+Or search .data for code patterns near known hypercall wrappers.
+
+**b) Probe all 17 hypercalls**
 ```
-0xC0000080 - EFER (Extended Feature Enable Register)
-  → Bit 12: SVME (SVM enable)
-  → Bit 16: xotext/nda feature enable
-  → Bit 11: NXE (No-Execute enable)
-
-0xC0010114 - VM_CR (VM Configuration Register)
-  → Bit 4: SVMDIS (SVM disable)
-  → Bit 3: LOCK (SVM lock)
-  → Reveals whether SVM can be reconfigured
-
-0xC0010117 - VM_HSAVE_PA (Host Save Area Physical Address)
-  → Physical address where host state is saved on VMRUN
-  → This is adjacent to or near the VMCB
-
-0xC0010130-0xC001013F - SMI_ON_IO_TRAP / SVM related
-0xC0000101 - GS_BASE (used for PCPU pointer)
-0xC0000102 - KERNEL_GS_BASE
-0x00000277 - PAT (Page Attribute Table)
+For each hypercall_id in 0x00..0x10:
+  Set RAX = hypercall_id
+  Set safe/neutral arguments in RDI, RSI, RDX, RCX
+  Execute VMMCALL
+  Record: return value (RAX), modified registers, timing
 ```
+This is safe because VMMCALL is the designed HV interface — the HV expects to receive
+these calls. Invalid function numbers should return an error code, not panic.
 
-**What the reads reveal:**
-- EFER tells us exactly which SVM features are enabled
-- VM_HSAVE_PA gives us a physical address anchor into HV memory
-- VM_CR tells us if SVM configuration is locked
-- Comparing guest-visible vs actual MSR values reveals what the HV intercepts
-
-**Note:** MSR reads from the guest may return intercepted/virtualized values. The
-MSRPM (MSR Protection Map) bitmap controls which MSRs trigger #VMEXIT on access.
-If a read returns a value, it's either the real value or the HV's virtualized value —
-both are informative.
-
-### Strategy 5: Page Table Archaeology
-**Risk: NONE — reading .data structures**
-
-With `r0gdb_read_cr3()` and kernel R/W, we can walk the entire page table hierarchy:
-
-**a) Walk guest page tables (GPT)**
-```
-CR3 → PML4 → PDPT → PD → PT → Physical page
-```
-For each entry, extract:
-- Present bit, R/W bit, U/S bit, XD (NX) bit
-- Physical address of next level / final page
-- **The xotext bit (bit 58 in NPT entries)** — but this is in nested page tables
-
-**b) Locate the NPT root**
-The nested page table root CR3 is stored in the VMCB (offset 0x008 in the VMCB
-control area for nCR3). If we can find the VMCB physical address through:
-- VM_HSAVE_PA MSR → nearby in physical memory
-- Scanning low physical memory via DMAP for VMCB signatures
-- Finding NPT root references in kernel .data
-
-**c) Walk NPT entries to map XOM**
-Once we have the NPT root, walk the nested page tables:
-- Entries with bit 58 set = xotext (XOM-protected)
-- Entries without bit 58 = normal access
-- This gives a complete map of what's protected and what isn't
-
-**d) DMAP base calculation**
-The porting_tool already calculates this:
-```python
-dmem_base = deref('kernel_pmap_store', 32) - deref('kernel_pmap_store', 40)
-```
-The DMAP maps all physical memory into kernel virtual space, so:
-- `dmap_base + physical_addr` = kernel virtual address
-- This lets us read ANY physical page (that isn't XOM-protected)
-- The HV's own code pages (separate binary on FW 4.03) might be readable
-  if they're only XOM-protected via NPT and we access through DMAP
-
-### Strategy 6: HV Code Through DMAP (HIGH VALUE)
-**Risk: MEDIUM — may panic if HV pages are also NPT-protected from DMAP reads**
-
-On FW 4.03, the HV is a separate binary loaded at a specific physical address range.
-The kernel .text is XOM-protected via NPT, but:
-
-**Critical question: Is the HV's own code XOM-protected from the guest?**
-
-If the HV only XOM-protects kernel .text pages (which is what the documentation
-suggests — "kernel .text pages are marked as eXecute Only Memory"), then:
-- The HV's own code lives at different physical pages
-- Those physical pages might be readable through the DMAP
-- Reading them wouldn't trigger XOM because XOM is only enforced on kernel .text PTEs
-
-**How to test safely:**
-1. Read CR3 and walk guest page tables to find all mapped regions
-2. Walk NPT (if accessible) to find non-XOM physical pages
-3. Identify physical address ranges that correspond to the HV binary
-4. Attempt a **small** read (1 byte) of a candidate HV page via DMAP
-5. If it doesn't panic → we can dump the entire HV
-
-**Why this might work:**
-- The HV intercepts are set up to protect kernel .text integrity
-- The HV's own code runs at a higher privilege level (host mode)
-- NPT mappings for guest access may not cover HV-private physical pages at all
-  (they'd simply be unmapped in the guest NPT, causing #NPF → not a panic,
-  just a fault that could be caught)
-
-**Why this might not work:**
-- Sony may have mapped the HV physical pages as inaccessible in the guest NPT
-- An NPF on unmapped pages might still crash (depends on how the HV handles it)
-
-**Safe testing approach:**
-- Set up r0gdb with a controlled trap handler
-- Install a custom #PF handler that catches faults gracefully
-- Attempt the DMAP read inside the trap handler
-- If it faults, the handler returns cleanly without panic
-
-### Strategy 7: Speculative / Timing Side Channels
-**Risk: NONE — passive observation**
-
-Even without reading code, timing differences reveal information:
-
-**a) Performance counters via MSR**
-AMD CPUs expose performance monitoring counters. Read them before/after executing
-a code path to count:
-- Retired instructions
-- Branch mispredictions
-- Cache hits/misses
-- TLB misses
-
-This reveals code complexity and branching behavior.
-
-**b) Cache side channels (FLUSH+RELOAD / PRIME+PROBE)**
-After executing a kernel function, probe cache lines to determine:
-- Which code pages were accessed (revealing execution path)
-- Which data structures were touched
-- Whether specific branches were taken
-
-**c) TSC (Time Stamp Counter) measurements**
-Measure execution time of hypercalls or kernel functions to:
-- Distinguish fast-path vs slow-path execution
-- Identify which hypercall numbers are valid vs invalid
-- Detect internal branching within the HV
-
-### Strategy 8: IOMMU/GPU DMA as a Read Oracle
-**Risk: MEDIUM — requires GPU programming expertise**
-
-On FW 4.03, the IOMMU is managed by the HV. However:
-- The GPU has DMA access that goes through the IOMMU
-- If the IOMMU doesn't enforce XOM the same way NPT does...
-- A GPU compute shader could potentially DMA-read kernel .text pages
-
-This is the technique used on FW 6.00+ to bypass .data write protection.
-On 4.03 where .data is already writable, the same DMA mechanism could
-potentially be used for .text READS instead.
-
-**Implementation path:**
-1. Find GPU command buffer submission interfaces in kernel .data
-2. Craft a GPU compute shader that reads from a physical address
-3. Submit via kernel R/W into GPU command buffers
-4. GPU DMA reads bypass CPU-side NPT (goes through IOMMU instead)
-5. If IOMMU doesn't enforce XOM → full kernel .text dump
+**c) Deep probing of interesting hypercalls**
+For hypercalls that return data (rather than just error codes), systematically vary
+the arguments and observe how return values change. This reverse-engineers the
+HV API from the outside.
 
 ---
 
-## Recommended Execution Order
+## Implementation: Safe HV Probe Payload
 
-### Phase 1: Information Gathering (Zero Risk)
-1. **Dump kernel .data** — get the full ~134MB kdata dump
-2. **Read all SVM-related MSRs** — EFER, VM_CR, VM_HSAVE_PA, etc.
-3. **Read CR3** — get the guest page table root
-4. **Walk guest page tables** — map all virtual→physical translations
-5. **Extract all IDT entries** — get all .text handler addresses
-6. **Locate kernel_pmap_store** — get DMAP base and physical layout
+The payload should run AFTER kstuff uelf is installed (for #GP handler coverage).
+Built with PS5 Payload SDK, sent via idlesauce host to 192.168.0.88.
 
-### Phase 2: Page Table Analysis (Zero Risk)
-7. **Analyze guest page tables** — identify all .text vs .data regions
-8. **Attempt to find NPT root** — via VMCB location or .data scanning
-9. **Walk NPT if accessible** — map XOM bits across all physical pages
-10. **Identify HV physical address range** — from NPT or physical memory scan
+### Payload structure:
+```
+1. Connect socket back to Mac at 192.168.0.99
+2. Phase 1: Dump full guest page table hierarchy → send to Mac
+3. Phase 2: Scan kdata dump for HV artifacts → send results to Mac
+4. Phase 3: Trace key code paths → send traces to Mac
+5. Phase 4: Probe MSRs (with #GP safety net) → send results to Mac
+6. Phase 5: Probe VMMCALLs → send results to Mac
+```
 
-### Phase 3: Controlled Probing (Low Risk)
-11. **Probe DMAP reads of HV pages** — with fault handling in place
-12. **Trace VMMCALL wrapper** — find the gadget address via single-step
-13. **Enumerate all 17 hypercalls** — probe each with safe parameters
-14. **Single-step key interrupt handlers** — IDT[14] (#PF), IDT[13] (#GP)
+### What this gives us:
+- Complete physical memory map of the guest
+- .text vs .data physical address classification
+- All function pointers in .data (indirect .text address map)
+- EFER/SVM configuration (if readable)
+- MSRPM bitmap (reversed from #GP probing)
+- Hypercall interface behavior
+- Traced instruction-by-instruction disassembly of key kernel functions
 
-### Phase 4: Deep Analysis (Low-Medium Risk)
-15. **Build full trace of VMMCALL paths** — how does the kernel invoke each call?
-16. **Trace IOMMU setup code** — understand GPU DMA configuration
-17. **Attempt GPU DMA read of .text** — if IOMMU allows it
-18. **Map QA flags structure** — for potential sleep/resume approaches
-
----
-
-## Implementation Notes for ELF Payload
-
-The ELF payload should be built with PS5 Payload SDK and sent via the idlesauce
-host to 192.168.0.88. The payload should:
-
-1. Initialize r0gdb (reuse kstuff's `r0gdb_init()`)
-2. Set up socket connection back to Mac at 192.168.0.99 for data exfiltration
-3. Implement each probe as a separate function callable via kekcall
-4. Send results back over the socket in a structured format
-5. Include fault handling (r0gdb's IDT manipulation) to catch #PF/#GP gracefully
-
-Key files to base the payload on:
-- `prosper0gdb/r0gdb.c` — kernel R/W, MSR, CR3, debug register primitives
-- `ps5-kstuff/main.c` — ELF loading, IDT/GDT/TSS manipulation
-- `ps5-kstuff/porting_tool/main.py` — offset discovery techniques (reference)
-- `gdb_stub/ring0.c` — ring0 execution framework
+This is enough to understand the HV's interface and constraints, identify potential
+vulnerabilities, and plan a targeted HV compromise — all without a single kernel
+panic.
 
 ---
 
-## Key Constraints
+## What This Won't Give Us (Limitations)
 
-- **NEVER use kread8/copyout on .text addresses** — instant panic
-- **The comparison_table mechanism (cmpb in kelf.asm) uses rep movsb** — this is a
-  CPU read operation and WILL trigger XOM on .text pages
-- **Single-stepping is safe** — the CPU executes instructions (allowed), then traps
-- **All .data reads are safe** — the HV only protects .text
-- **MSR reads from guest may return virtualized values** — still informative
-- **Hypercall probing should use known-valid parameters first** — validate the
-  interface before fuzzing
+- **HV code disassembly** — we cannot read HV code. We can only observe its external
+  behavior (hypercall returns, MSR interception decisions, XOM enforcement patterns).
+- **NPT structure** — nested page table entries are at HV-private physical addresses.
+  We cannot read them from the guest without risking #NPF → panic.
+- **VMCB contents** — the VMCB is at a physical address we likely can't read.
+- **HV internal data structures** — unless they're shared with the guest (like QA flags
+  were on ≤2.50), we can't access them.
+
+**The path forward after this research:**
+The goal is to find enough information from the safe probing to identify a vulnerability
+in the HV's guest-facing interface (hypercalls, MSR handling, interrupt handling,
+page table management) that allows escalation to HV code execution or XOM disablement.
+Byepervisor found two such vulnerabilities on ≤2.50:
+1. Shared jump table in .data (FW ≤2.70)
+2. QA flags not reinitialized on sleep resume
+
+Similar guest-facing attack surface exists on FW 4.03 — we just need to find it.
 
 ---
 
@@ -420,6 +349,6 @@ Key files to base the payload on:
 - [Byepervisor (FW ≤2.50)](https://github.com/PS5Dev/Byepervisor)
 - [PS5-UMTX-Jailbreak](https://github.com/PS5Dev/PS5-UMTX-Jailbreak)
 - [idlesauce/umtx2](https://github.com/idlesauce/umtx2)
-- [Cryptogenic/PS5-IPV6-Kernel-Exploit](https://github.com/Cryptogenic/PS5-IPV6-Kernel-Exploit)
 - [Byepervisor talk at hardwear.io NL 2024](https://hardwear.io/netherlands-2024/speakers/specter.php)
 - [AMD SVM Architecture Reference](https://www.0x04.net/doc/amd/33047.pdf)
+- [Google Project Zero - KVM VMCB escape](https://projectzero.google/2021/06/an-epyc-escape-case-study-of-kvm.html)
