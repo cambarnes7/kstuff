@@ -43,7 +43,7 @@
  * CONFIGURATION - Edit before building
  * ================================================================ */
 
-#define LISTENER_IP   "192.168.1.100"
+#define LISTENER_IP   "192.168.0.99"
 #define LISTENER_PORT 9999
 
 /* Timing threshold: instructions taking more than this many cycles
@@ -394,22 +394,39 @@ static struct probe_def probes[] = {
 
 int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
 {
+    /* DIAGNOSTIC: verify payload entry is reached at all */
+    notify("HV: payload started");
+
     if(r0gdb_init(ds, a, b, c, d))
     {
-        notify("HV Research: FW not supported");
+        notify("HV: FW not supported");
         return 1;
     }
 
+    notify("HV: r0gdb init OK");
+
     uint32_t fw_version = r0gdb_get_fw_version();
 
-    notify("HV Research: Connecting...");
+    {
+        char msg[64] = "HV: FW=0x";
+        char hex[] = "0123456789abcdef";
+        char* p = msg + 9;
+        for(int i = 28; i >= 0; i -= 4)
+            *p++ = hex[(fw_version >> i) & 0xf];
+        *p = 0;
+        notify(msg);
+    }
+
+    notify("HV: connecting to listener...");
 
     int sock = r0gdb_open_socket(LISTENER_IP, LISTENER_PORT);
     if(sock < 0)
     {
-        notify("HV Research: Connect failed!");
+        notify("HV: connect failed!");
         return 1;
     }
+
+    notify("HV: connected OK");
 
     /* Allocate trace buffer */
     size_t buf_size = sizeof(struct trace_entry) * MAX_TRACE_INSTRS;
@@ -417,11 +434,13 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
                        MAP_PRIVATE|MAP_ANON, -1, 0);
     if(g_trace_buf == MAP_FAILED)
     {
-        notify("HV Research: alloc failed!");
+        notify("HV: alloc failed!");
         close(sock);
         return 1;
     }
     g_trace_max = MAX_TRACE_INSTRS;
+
+    notify("HV: setting up instrumentation...");
 
     /* Set up r0gdb instrumentation (single-step infrastructure).
      * This patches the IDT #DB handler, modifies FMASK MSR to preserve
@@ -432,6 +451,8 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
      * After r0gdb_instrument(0), uretframe points to the ret2trace
      * iret frame. We save it so we can restore it before each trace. */
     copyout(saved_uretframe, uretframe, sizeof(saved_uretframe));
+
+    notify("HV: instrumentation ready, starting traces...");
 
     /* Send file header */
     struct trace_file_header fhdr;

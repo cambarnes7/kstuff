@@ -6,7 +6,7 @@ OBJCOPY = $(CROSS_COMPILE)objcopy
 all: payload.bin payload-gdb.bin
 
 clean:
-	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin payload-hv.elf payload-hv.bin freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
+	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin payload-hv.elf payload-hv.bin payload-test.elf payload-test.bin freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
 
 ../lib/lib-elf-ps5.a:
 	$(MAKE) -C ../lib CROSS_COMPILE=$(CROSS_COMPILE)
@@ -25,6 +25,9 @@ payload-gdb.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o main.c sqlite
 
 payload-hv.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o hv_research.c
 	$(CC) -O0 -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o $(EXTRA_CFLAGS) hv_research.c -DPS5KEK ../prosper0gdb/dbg.c -Wl,-gc-sections -o payload-hv.elf -fPIE -ffreestanding -no-pie -Wl,-z,max-page-size=16384 -Wl,-zcommon-page-size=16384
+
+payload-test.elf: ../lib/lib-elf-ps5.a test_notify.c
+	$(CC) -O0 -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a $(EXTRA_CFLAGS) test_notify.c -DPS5KEK -Wl,-gc-sections -o payload-test.elf -fPIE -ffreestanding -no-pie -Wl,-z,max-page-size=16384 -Wl,-zcommon-page-size=16384
 
 payloa%.bin: payloa%.elf
 	$(OBJCOPY) $< --only-section .text --only-section .data --only-section .bss --only-section .rodata -O binary $@
