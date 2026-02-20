@@ -3,6 +3,7 @@ use64
 global _start
 extern main
 extern addr__dynlib_dlsym
+extern p_syscall
 extern elf_main
 extern _end
 
@@ -45,8 +46,15 @@ dq _end-_start
 dq 0
 
 start3:
+; Pre-set p_syscall so syscalls work without dlsym (for loaders that don't pass it)
+lea r10, [rel syscall_gadget]
+mov [rel p_syscall], r10
 mov [rel addr__dynlib_dlsym], rdi
 jmp main
+
+syscall_gadget:
+syscall
+ret
 
 section .data
 _sdata:

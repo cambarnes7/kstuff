@@ -3,10 +3,10 @@ YASM ?= yasm
 LD ?= ld
 OBJCOPY ?= objcopy
 
-all: payload.bin payload-gdb.bin
+all: payload.bin payload-gdb.bin payload-gdb-elfldr.elf
 
 clean:
-	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
+	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin payload-gdb-elfldr.elf freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
 
 ../lib/lib-elf-ps5.a:
 	cd ../lib; make
@@ -22,6 +22,9 @@ payload.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o main.c sqlite_tri
 
 payload-gdb.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o main.c sqlite_triggers.c utils.c kelf uelf/uelf
 	$(CC) -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o $(EXTRA_CFLAGS) -DDEBUG main.c -DPS5KEK ../prosper0gdb/dbg.c sqlite_triggers.c utils.c -o payload-gdb.elf -fPIE -ffreestanding -no-pie -Wl,-z,max-page-size=16384 -Wl,-zcommon-page-size=16384
+
+payloa%-elfldr.elf: payloa%.elf
+	$(OBJCOPY) --strip-all $< $@
 
 payloa%.bin: payloa%.elf
 	$(OBJCOPY) $< --only-section .text --only-section .data --only-section .bss --only-section .rodata -O binary $@

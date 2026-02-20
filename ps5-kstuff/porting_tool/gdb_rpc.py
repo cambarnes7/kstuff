@@ -87,12 +87,14 @@ class GDB:
             return True
         return False
     def build(self, payload, flags):
+        subprocess.call(('make', 'lib-elf-ps5.a'), cwd='../../lib')
         assert not subprocess.call(('make', 'EXTRA_CFLAGS='+' '.join(flags), 'clean', 'all'), cwd='../../'+payload)
     def send_payload(self, path):
         send_path = path
         if self.use_elf and send_path.endswith('.bin'):
             # ps5-payload-elfldr expects standard ELF, not PLD/FrankenELF format
-            send_path = send_path[:-4] + '.elf'
+            # Use stripped ELF (-elfldr.elf) to avoid PS5 OOM from debug symbols
+            send_path = send_path.replace('.bin', '-elfldr.elf')
         with open('../../'+send_path, 'rb') as file:
             data = memoryview(file.read())
         while True:

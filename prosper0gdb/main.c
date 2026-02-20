@@ -130,8 +130,14 @@ void log_deltas(uint64_t pointer)
     }
 }
 
+extern void* addr____error;
+int dynlib_dlsym(int, const char*, void**);
+
 int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
 {
+    // Resolve __error early for errno support (p_syscall is pre-set by _start)
+    if(!addr____error)
+        dynlib_dlsym(1, "__error", &addr____error);
     r0gdb_init(ds, a, b, c, d);
     dbg_enter();
     return 0; //p r0gdb() for magic
