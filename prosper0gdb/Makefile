@@ -18,7 +18,7 @@ prosper0gdb.o: r0gdb.c r0run.o offsets.c offsets.h offset_list.txt
 	$(CC) -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -r -Wl,--unique='*' -ffunction-sections -fdata-sections $(EXTRA_CFLAGS) -DPS5KEK r0gdb.c r0run.o offsets.c -o prosper0gdb.o -fPIE -ffreestanding -fno-unwind-tables -fno-asynchronous-unwind-tables
 
 payload.elf: ../lib/lib-elf-ps5.a main.c prosper0gdb.o dbg.c
-	$(CC) -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a $(EXTRA_CFLAGS) main.c prosper0gdb.o -DPS5KEK dbg.c -o payload.elf -fPIE -ffreestanding -Wl,-no-pie -Wl,-zmax-page-size=16384 -Wl,-zcommon-page-size=16384
+	$(CC) -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a $(EXTRA_CFLAGS) main.c prosper0gdb.o -DPS5KEK dbg.c -o payload.elf -fPIE -ffreestanding -Wl,-no-pie -Wl,-gc-sections -Wl,-zmax-page-size=16384 -Wl,-zcommon-page-size=16384
 
 payload.bin: payload.elf
 	$(OBJCOPY) payload.elf --only-section .text --only-section .data --only-section .bss --only-section .rodata -O binary payload.bin
