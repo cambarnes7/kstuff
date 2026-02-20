@@ -1073,7 +1073,7 @@ static void instr_count_and_hang(uint64_t* regs)
         instrs_left--;
 }
 
-static int count_instrs(void(*fn)(), uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t entry, uint64_t jump, int instrs)
+static int count_instrs(void(*fn)(uint64_t, uint64_t, uint64_t), uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t entry, uint64_t jump, int instrs)
 {
     r0gdb_trace_reset();
     trace_prog = instr_count;
