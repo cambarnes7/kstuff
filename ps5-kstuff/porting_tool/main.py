@@ -1,10 +1,22 @@
-import sys, json, threading, functools, os.path, collections, tarfile, io, re, time
+import sys, json, threading, functools, os.path, os, collections, tarfile, io, re, time, shutil
 
-if 'linux' not in sys.platform:
-    print('This tool only supports GNU/Linux! Use Docker or WSL on other OSes.')
+if sys.platform not in ('linux', 'darwin'):
+    print('This tool supports Linux and macOS. Use WSL on Windows.')
     input('Press Enter to exit')
     exit(1)
-elif len(sys.argv) not in (3, 4, 5):
+
+# On macOS, auto-configure cross-compilation toolchain
+if sys.platform == 'darwin':
+    if shutil.which('x86_64-elf-gcc'):
+        os.environ.setdefault('CC', 'x86_64-elf-gcc')
+        os.environ.setdefault('LD', 'x86_64-elf-ld')
+        os.environ.setdefault('OBJCOPY', 'x86_64-elf-objcopy')
+    else:
+        print('macOS requires x86_64-elf-gcc cross-compiler:')
+        print('  brew install x86_64-elf-gcc yasm gdb')
+        exit(1)
+
+if len(sys.argv) not in (3, 4, 5):
     print('usage: main.py <database> <ps5 ip> [port for payload loader] [kernel data dump]')
     exit(0)
 
