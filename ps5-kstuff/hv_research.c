@@ -35,6 +35,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include "../prosper0gdb/r0gdb.h"
 #include "../prosper0gdb/offsets.h"
 #include "../gdb_stub/dbg.h"
@@ -428,6 +430,28 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         char* p = msg + 9;
         for(int i = 28; i >= 0; i -= 4)
             *p++ = hex[(fw_version >> i) & 0xf];
+        *p = 0;
+        notify(msg);
+    }
+
+    /* Test if the IPv6 socket pair actually does kernel r/w */
+    {
+        char tbuf[20] = {0};
+        *(uint64_t*)tbuf = d; /* kdata_base */
+        int sr = setsockopt(a, IPPROTO_IPV6, IPV6_PKTINFO, tbuf, 20);
+        unsigned int tl = 20;
+        int gr = getsockopt(b, IPPROTO_IPV6, IPV6_PKTINFO, tbuf, &tl);
+        uint64_t kval = *(uint64_t*)tbuf;
+
+        char msg[128] = "HV: krw sr=";
+        char* p = msg + 11;
+        p += fmt_int(p, sr);
+        *p++ = ' '; *p++ = 'g'; *p++ = 'r'; *p++ = '=';
+        p += fmt_int(p, gr);
+        *p++ = ' '; *p++ = 'v'; *p++ = '='; *p++ = '0'; *p++ = 'x';
+        char hex[] = "0123456789abcdef";
+        for(int i = 60; i >= 0; i -= 4)
+            *p++ = hex[(kval >> i) & 0xf];
         *p = 0;
         notify(msg);
     }
