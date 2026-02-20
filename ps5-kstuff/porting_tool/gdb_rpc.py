@@ -1,4 +1,4 @@
-import subprocess, os, threading, socket, sys, signal, time, functools
+import subprocess, os, threading, socket, sys, signal, time, functools, platform
 
 token = os.urandom(16).hex()
 
@@ -116,7 +116,8 @@ class GDB:
     def _monitor(self):
         alive = False
         while True:
-            p = subprocess.Popen(('ping', '-W', '5', self.ps5_ip), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, preexec_fn=type(self._monitor)(signal.alarm, 5))
+            ping_cmd = ('ping', '-c', '1', '-t', '5', self.ps5_ip) if sys.platform == 'darwin' else ('ping', '-W', '5', self.ps5_ip)
+            p = subprocess.Popen(ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, preexec_fn=type(self._monitor)(signal.alarm, 5))
             q = p.communicate()[0]
             if p.wait() > 0 or b'64 bytes from ' not in q:
                 if alive:

@@ -9,15 +9,38 @@ Requires: porting_tool offsets already discovered (database.json populated).
 The PS5 must be jailbroken with r0gdb ready (same state as porting_tool).
 """
 
-import sys, json
+import sys, json, shutil, subprocess
 
-if 'linux' not in sys.platform:
-    print('This tool only supports GNU/Linux! Use Docker or WSL on other OSes.')
+if sys.platform not in ('linux', 'darwin'):
+    print('This tool supports Linux and macOS. Use WSL on Windows.')
     sys.exit(1)
 
 if len(sys.argv) not in (3, 4):
     print('usage: run_hv_probe.py <database.json> <ps5_ip> [port]')
     sys.exit(1)
+
+# On macOS, check for required cross-compilation tools
+if sys.platform == 'darwin':
+    missing_tools = []
+    # Check for ELF cross-compiler (needed to build r0gdb payload)
+    if shutil.which('x86_64-elf-gcc'):
+        # Export so Makefiles pick up the cross-compiler
+        import os
+        os.environ.setdefault('CC', 'x86_64-elf-gcc')
+        os.environ.setdefault('LD', 'x86_64-elf-ld')
+        os.environ.setdefault('OBJCOPY', 'x86_64-elf-objcopy')
+    elif not shutil.which('gcc') or b'Mach-O' in subprocess.check_output(
+            ['gcc', '-dumpmachine'], stderr=subprocess.DEVNULL):
+        missing_tools.append(('x86_64-elf-gcc', 'brew install x86_64-elf-gcc'))
+    if not shutil.which('yasm'):
+        missing_tools.append(('yasm', 'brew install yasm'))
+    if not shutil.which('gdb'):
+        missing_tools.append(('gdb', 'brew install gdb'))
+    if missing_tools:
+        print('[!] missing required tools for macOS:')
+        for tool, cmd in missing_tools:
+            print('    %s  ->  %s' % (tool, cmd))
+        sys.exit(1)
 
 import gdb_rpc, traces, hv_probe
 
