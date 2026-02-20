@@ -35,8 +35,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdbool.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include "../prosper0gdb/r0gdb.h"
 #include "../prosper0gdb/offsets.h"
 #include "../gdb_stub/dbg.h"
@@ -396,85 +394,24 @@ static struct probe_def probes[] = {
 
 int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
 {
-    /* DIAGNOSTIC: verify payload entry is reached at all */
     notify("HV: payload started");
 
-    /* Show the raw arguments to verify payload_args unpacking */
-    {
-        char msg[128] = "HV: fds=";
-        char* p = msg + 8;
-        /* a = master_fd */
-        p += fmt_int(p, a);
-        *p++ = ',';
-        /* b = victim_fd */
-        p += fmt_int(p, b);
-        *p++ = ' ';
-        *p++ = 'k';
-        *p++ = 'b';
-        *p++ = '=';
-        /* d = kdata_base (show as hex) */
-        char hex[] = "0123456789abcdef";
-        *p++ = '0';
-        *p++ = 'x';
-        for(int i = 60; i >= 0; i -= 4)
-            *p++ = hex[(d >> i) & 0xf];
-        *p = 0;
-        notify(msg);
-    }
-
-    /* Test sysctl (fw version) BEFORE r0gdb_init to isolate the hang */
     uint32_t fw_version = r0gdb_get_fw_version();
-    {
-        char msg[64] = "HV: FW=0x";
-        char hex[] = "0123456789abcdef";
-        char* p = msg + 9;
-        for(int i = 28; i >= 0; i -= 4)
-            *p++ = hex[(fw_version >> i) & 0xf];
-        *p = 0;
-        notify(msg);
-    }
 
-    /* Test if the IPv6 socket pair actually does kernel r/w */
-    {
-        char tbuf[20] = {0};
-        *(uint64_t*)tbuf = d; /* kdata_base */
-        int sr = setsockopt(a, IPPROTO_IPV6, IPV6_PKTINFO, tbuf, 20);
-        unsigned int tl = 20;
-        int gr = getsockopt(b, IPPROTO_IPV6, IPV6_PKTINFO, tbuf, &tl);
-        uint64_t kval = *(uint64_t*)tbuf;
-
-        char msg[128] = "HV: krw sr=";
-        char* p = msg + 11;
-        p += fmt_int(p, sr);
-        *p++ = ' '; *p++ = 'g'; *p++ = 'r'; *p++ = '=';
-        p += fmt_int(p, gr);
-        *p++ = ' '; *p++ = 'v'; *p++ = '='; *p++ = '0'; *p++ = 'x';
-        char hex[] = "0123456789abcdef";
-        for(int i = 60; i >= 0; i -= 4)
-            *p++ = hex[(kval >> i) & 0xf];
-        *p = 0;
-        notify(msg);
-    }
-
-    notify("HV: calling r0gdb_init...");
     if(r0gdb_init(ds, a, b, c, d))
     {
-        notify("HV: FW not supported");
+        notify("HV: r0gdb_init failed (FW not supported?)");
         return 1;
     }
 
     notify("HV: r0gdb init OK");
 
-    notify("HV: connecting to listener...");
-
     int sock = r0gdb_open_socket(LISTENER_IP, LISTENER_PORT);
     if(sock < 0)
     {
-        notify("HV: connect failed!");
+        notify("HV: connect failed - check IP/port");
         return 1;
     }
-
-    notify("HV: connected OK");
 
     /* Allocate trace buffer */
     size_t buf_size = sizeof(struct trace_entry) * MAX_TRACE_INSTRS;
@@ -488,19 +425,11 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     }
     g_trace_max = MAX_TRACE_INSTRS;
 
-    notify("HV: setting up instrumentation...");
-
-    /* Set up r0gdb instrumentation (single-step infrastructure).
-     * This patches the IDT #DB handler, modifies FMASK MSR to preserve
-     * TF through syscall, and sets up the ret2trace mechanism. */
+    /* Set up r0gdb instrumentation (single-step infrastructure) */
     r0gdb_instrument(0);
-
-    /* Save uretframe contents for my_set_trace().
-     * After r0gdb_instrument(0), uretframe points to the ret2trace
-     * iret frame. We save it so we can restore it before each trace. */
     copyout(saved_uretframe, uretframe, sizeof(saved_uretframe));
 
-    notify("HV: instrumentation ready, starting traces...");
+    notify("HV: starting traces...");
 
     /* Send file header */
     struct trace_file_header fhdr;

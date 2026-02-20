@@ -32,12 +32,137 @@ along with this program; see the file COPYING. If not, see
 #include <sys/user.h>
 
 #include <machine/param.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <ps5/payload.h>
+#include <ps5/kernel.h>
 #include <ps5/klog.h>
 #include "payload_bin.c"
 
 int patch_app_db(void);
 int sceKernelSetProcessName(const char *name);
+
+/*
+ * Set up IPv6 pktopts corruption on the rwpair sockets so that
+ * prosper0gdb's kread8/kwrite20 work.
+ *
+ * The exploit (idlesauce) provides IPv6 socket FDs in rwpair but does NOT
+ * set up the pktopts corruption that prosper0gdb expects. The exploit uses
+ * a pipe-based kernel r/w mechanism instead. The PS5 SDK exposes this as
+ * kernel_copyin/kernel_copyout, which we use here to set up the corruption.
+ *
+ * How the corruption works:
+ *   master's ip6po_pktinfo pointer is overwritten to point at the memory
+ *   location of victim's ip6po_pktinfo pointer field. Then:
+ *   - setsockopt(master, IPV6_PKTINFO, {addr,...}) writes addr into
+ *     victim's ip6po_pktinfo pointer
+ *   - getsockopt(victim, IPV6_PKTINFO, buf) reads 20 bytes from addr
+ *   This gives arbitrary kernel read (kread8) and write (kwrite20).
+ *
+ * Kernel structure offsets (same across PS5 FWs):
+ *   proc + 0xbc   = p_pid
+ *   proc + 0x48   = p_fd (filedesc*)
+ *   fd + 0        = fd_ofiles
+ *   ofiles + 8 + 48*n = file* for fd n
+ *   file + 0      = f_data (socket*)
+ *   socket + 24   = so_pcb (inpcb*)
+ *   inpcb + 288   = in6p_outputopts (ip6_pktopts*)
+ *   ip6_pktopts + 16 = ip6po_pktinfo (in6_pktinfo*)
+ */
+static int setup_ipv6_krw(payload_args_t *args) {
+    int master_fd = args->rwpair[0];
+    int victim_fd = args->rwpair[1];
+    intptr_t kdata_base = args->kdata_base_addr;
+
+    /* Determine allproc offset from firmware version */
+    int mib[2] = {1, 46};
+    size_t mib_size = 4;
+    unsigned int fw_version = 0;
+    sysctl(mib, 2, &fw_version, &mib_size, NULL, 0);
+
+    intptr_t allproc_offset;
+    switch(fw_version) {
+    case 0x04030000: allproc_offset = 0x27edcb8; break;
+    default:
+        klog_printf("setup_ipv6_krw: unsupported FW 0x%08x\n", fw_version);
+        return -1;
+    }
+    intptr_t allproc_addr = kdata_base + allproc_offset;
+
+    /* Allocate pktinfo on both sockets via setsockopt.
+     * This causes the kernel to allocate ip6_pktopts and in6_pktinfo
+     * structs for each socket. */
+    char pktinfo_buf[20] = {0};
+    if(setsockopt(master_fd, IPPROTO_IPV6, IPV6_PKTINFO,
+                  pktinfo_buf, sizeof(pktinfo_buf)) < 0) {
+        klog_printf("setup_ipv6_krw: master setsockopt failed\n");
+        return -2;
+    }
+    if(setsockopt(victim_fd, IPPROTO_IPV6, IPV6_PKTINFO,
+                  pktinfo_buf, sizeof(pktinfo_buf)) < 0) {
+        klog_printf("setup_ipv6_krw: victim setsockopt failed\n");
+        return -3;
+    }
+
+    /* Find our proc struct by walking the allproc list */
+    uint64_t proc = 0;
+    kernel_copyout(allproc_addr, &proc, 8);
+    pid_t mypid = getpid();
+    while(proc) {
+        int32_t pid = 0;
+        kernel_copyout(proc + 0xbc, &pid, 4);
+        if(pid == mypid) break;
+        uint64_t next = 0;
+        kernel_copyout(proc, &next, 8);
+        proc = next;
+    }
+    if(!proc) {
+        klog_printf("setup_ipv6_krw: proc not found for pid %d\n", mypid);
+        return -4;
+    }
+
+    /* Traverse fd table -> socket -> inpcb -> ip6_pktopts */
+    uint64_t fd_table = 0;
+    kernel_copyout(proc + 0x48, &fd_table, 8);
+    uint64_t ofiles = 0;
+    kernel_copyout(fd_table, &ofiles, 8);
+
+    /* Master socket */
+    uint64_t master_file = 0;
+    kernel_copyout(ofiles + 8 + 48 * master_fd, &master_file, 8);
+    uint64_t master_data = 0;
+    kernel_copyout(master_file, &master_data, 8);
+    uint64_t master_pcb = 0;
+    kernel_copyout(master_data + 24, &master_pcb, 8);
+    uint64_t master_pktopts = 0;
+    kernel_copyout(master_pcb + 288, &master_pktopts, 8);
+
+    /* Victim socket */
+    uint64_t victim_file = 0;
+    kernel_copyout(ofiles + 8 + 48 * victim_fd, &victim_file, 8);
+    uint64_t victim_data = 0;
+    kernel_copyout(victim_file, &victim_data, 8);
+    uint64_t victim_pcb = 0;
+    kernel_copyout(victim_data + 24, &victim_pcb, 8);
+    uint64_t victim_pktopts = 0;
+    kernel_copyout(victim_pcb + 288, &victim_pktopts, 8);
+
+    if(!master_pktopts || !victim_pktopts) {
+        klog_printf("setup_ipv6_krw: pktopts NULL (m=0x%lx v=0x%lx)\n",
+                     (unsigned long)master_pktopts,
+                     (unsigned long)victim_pktopts);
+        return -5;
+    }
+
+    /* Corrupt master's ip6po_pktinfo to point at victim's ip6po_pktinfo
+     * field. ip6po_pktinfo is at offset 16 in ip6_pktopts. */
+    uint64_t target = victim_pktopts + 16;
+    kernel_copyin(&target, master_pktopts + 16, 8);
+
+    klog_printf("setup_ipv6_krw: OK (m_opts=0x%lx v_opts=0x%lx)\n",
+                 (unsigned long)master_pktopts, (unsigned long)victim_pktopts);
+    return 0;
+}
 
 #define ROUND_PG(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #define TRUNC_PG(x) ((x) & ~(PAGE_SIZE - 1))
@@ -249,6 +374,13 @@ int main(void) {
 
     void (*entry)(payload_args_t*) = base + ehdr->e_entry;
     payload_args_t* args = payload_get_args();
+
+    /* Set up IPv6 pktopts corruption so the kernel payload's
+     * kread8/kwrite20 primitives work via the rwpair sockets. */
+    int krw_rc = setup_ipv6_krw(args);
+    if(krw_rc != 0) {
+        klog_printf("WARNING: setup_ipv6_krw failed (%d)\n", krw_rc);
+    }
 
     entry(args);
     if(*args->payloadout == 0) {
