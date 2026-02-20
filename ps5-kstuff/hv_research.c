@@ -397,8 +397,30 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     /* DIAGNOSTIC: verify payload entry is reached at all */
     notify("HV: payload started");
 
+    /* Show the raw arguments to verify payload_args unpacking */
+    {
+        char msg[128] = "HV: fds=";
+        char* p = msg + 8;
+        /* a = master_fd */
+        p += fmt_int(p, a);
+        *p++ = ',';
+        /* b = victim_fd */
+        p += fmt_int(p, b);
+        *p++ = ' ';
+        *p++ = 'k';
+        *p++ = 'b';
+        *p++ = '=';
+        /* d = kdata_base (show as hex) */
+        char hex[] = "0123456789abcdef";
+        *p++ = '0';
+        *p++ = 'x';
+        for(int i = 60; i >= 0; i -= 4)
+            *p++ = hex[(d >> i) & 0xf];
+        *p = 0;
+        notify(msg);
+    }
+
     /* Test sysctl (fw version) BEFORE r0gdb_init to isolate the hang */
-    notify("HV: testing sysctl...");
     uint32_t fw_version = r0gdb_get_fw_version();
     {
         char msg[64] = "HV: FW=0x";
