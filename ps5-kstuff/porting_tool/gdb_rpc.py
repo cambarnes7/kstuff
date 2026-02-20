@@ -173,30 +173,66 @@ class GDB:
             ln = self._read_until(b'\n', tl)
             if ln.startswith(b'[[['):
                 return eval(ln.decode('ascii'))[0][0][0]
+    def _try_gdb_connect(self, port):
+        """Try to connect GDB to a specific port. Returns True on success."""
+        try:
+            self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
+            with stdio:
+                self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 3', '-ex', 'target remote '+self.ps5_ip+':'+str(port), '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
+            output = self._read_until(token.encode('ascii')+b'\n')
+            if b'could not connect' not in output and b'Connection refused' not in output and b'Connection timed out' not in output and b'Operation timed out' not in output:
+                return True
+            self.popen.kill()
+            self.popen = None
+            self.stdio = None
+        except DisconnectedException:
+            pass
+        return False
+
     def connect_gdb(self):
         assert self.popen == None
         print('Connecting GDB... ', end='')
         sys.stdout.flush()
+        # Try the configured port first (5 attempts with backoff)
         for attempt in range(5):
             if attempt > 0:
                 sys.stdout.write('retry %d... ' % attempt)
                 sys.stdout.flush()
                 time.sleep(3)
+            if self._try_gdb_connect(self.gdb_port):
+                print('done (port %d)' % self.gdb_port)
+                return
+        # If configured port failed, scan nearby ports.
+        # prosper0gdb's dbg_enter binds starting at 1234 and increments
+        # until it finds a free port. Scan 1234-1334 to find it.
+        print('port %d failed, scanning...' % self.gdb_port, end='')
+        sys.stdout.flush()
+        scan_start = 1234
+        scan_end = 1334
+        # Quick TCP probe to find which ports are open
+        open_ports = []
+        for port in range(scan_start, scan_end):
+            if port == self.gdb_port:
+                continue  # already tried
             try:
-                self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
-                with stdio:
-                    self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':'+str(self.gdb_port), '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
-                output = self._read_until(token.encode('ascii')+b'\n')
-                if b'could not connect' not in output and b'Connection refused' not in output and b'Connection timed out' not in output and b'Operation timed out' not in output:
-                    print('done')
-                    return
-                self.popen.kill()
-                self.popen = None
-                self.stdio = None
-            except DisconnectedException:
-                # GDB crashed before printing token, retry
+                s = socket.create_connection((self.ps5_ip, port), timeout=0.3)
+                s.close()
+                open_ports.append(port)
+            except socket.error:
                 pass
-        raise DisconnectedException("could not connect GDB to PS5 after 5 attempts")
+        if open_ports:
+            print(' found open: %s' % ', '.join(str(p) for p in open_ports))
+            for port in open_ports:
+                sys.stdout.write('trying port %d... ' % port)
+                sys.stdout.flush()
+                if self._try_gdb_connect(port):
+                    self.gdb_port = port
+                    print('done (port %d)' % port)
+                    return
+                print('no')
+        else:
+            print(' no open ports in %d-%d' % (scan_start, scan_end))
+        raise DisconnectedException("could not connect GDB to PS5 — prosper0gdb stub not found")
     def execute(self, cmd, timeout=None):
         if timeout is not None: timeout += time.time()
         assert self.popen != None
