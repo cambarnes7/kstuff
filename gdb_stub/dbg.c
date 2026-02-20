@@ -754,7 +754,7 @@ int gdbstub_main_loop(struct trap_state* ts, ssize_t* result, int* ern)
             start_packet(o);
             unsigned long long base_addr = ((unsigned long long)_start);
             static unsigned long long start_nonreloc = (unsigned long long)_start;
-#if defined(BLOB) || defined(OBJECT_FILE)
+#if defined(BLOB) || defined(OBJECT_FILE) || defined(PIE_BUILD)
             base_addr &= ~(PAGE_SIZE-1);
             char probe;
             while(!read_mem(&probe, base_addr, 1))

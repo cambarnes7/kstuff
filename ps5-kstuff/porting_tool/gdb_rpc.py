@@ -119,7 +119,11 @@ class GDB:
                     print(' done')
                     self.payload_path = path
                     if self.payload_path.endswith('.bin'):
-                        self.payload_path = self.payload_path[:-4]+'.elf'
+                        if self.use_elf:
+                            # PIE debug ELF matches the layout running on PS5 via elfldr
+                            self.payload_path = self.payload_path.replace('.bin', '-elfldr-dbg.elf')
+                        else:
+                            self.payload_path = self.payload_path[:-4]+'.elf'
                     return
                 print(' error, retrying')
     def _monitor(self):
