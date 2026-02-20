@@ -15,8 +15,8 @@ if sys.platform not in ('linux', 'darwin'):
     print('This tool supports Linux and macOS. Use WSL on Windows.')
     sys.exit(1)
 
-if len(sys.argv) not in (3, 4):
-    print('usage: run_hv_probe.py <database.json> <ps5_ip> [port]')
+if len(sys.argv) not in (3, 4, 5):
+    print('usage: run_hv_probe.py <database.json> <ps5_ip> [port] [gdb_port]')
     sys.exit(1)
 
 # On macOS, check for required cross-compilation tools
@@ -42,14 +42,15 @@ if sys.platform == 'darwin':
             print('    %s  ->  %s' % (tool, cmd))
         sys.exit(1)
 
-import gdb_rpc, traces, hv_probe
+import os, gdb_rpc, traces, hv_probe
 
 # Connect to PS5
 print('[*] connecting to PS5...')
-if len(sys.argv) == 4:
-    gdb = gdb_rpc.GDB(sys.argv[2], int(sys.argv[3]))
+_gdb_port = int(sys.argv[4]) if len(sys.argv) >= 5 else int(os.environ.get('GDB_PORT', '1234'))
+if len(sys.argv) >= 4:
+    gdb = gdb_rpc.GDB(sys.argv[2], int(sys.argv[3]), gdb_port=_gdb_port)
 else:
-    gdb = gdb_rpc.GDB(sys.argv[2])
+    gdb = gdb_rpc.GDB(sys.argv[2], gdb_port=_gdb_port)
 
 # Load offset database
 with open(sys.argv[1]) as f:

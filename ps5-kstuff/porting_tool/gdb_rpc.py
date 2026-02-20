@@ -21,9 +21,10 @@ while True:
 class DisconnectedException(Exception): pass
 
 class GDB:
-    def __init__(self, ps5_ip, ps5_port=9019):
+    def __init__(self, ps5_ip, ps5_port=9019, gdb_port=1234):
         self.ps5_ip = ps5_ip
         self.ps5_port = ps5_port
+        self.gdb_port = gdb_port
         # Non-default port means ps5-payload-elfldr (expects standard ELF, not PLD format)
         self.use_elf = ps5_port != 9019
         self.payload = None
@@ -184,7 +185,7 @@ class GDB:
             try:
                 self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
                 with stdio:
-                    self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
+                    self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':'+str(self.gdb_port), '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=subprocess.STDOUT, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
                 output = self._read_until(token.encode('ascii')+b'\n')
                 if b'could not connect' not in output and b'Connection refused' not in output and b'Connection timed out' not in output and b'Operation timed out' not in output:
                     print('done')

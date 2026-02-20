@@ -16,13 +16,22 @@ if sys.platform == 'darwin':
         print('  brew install x86_64-elf-gcc yasm gdb')
         exit(1)
 
-if len(sys.argv) not in (3, 4, 5):
-    print('usage: main.py <database> <ps5 ip> [port for payload loader] [kernel data dump]')
+if len(sys.argv) not in (3, 4, 5, 6):
+    print('usage: main.py <database> <ps5 ip> [port for payload loader] [kernel data dump] [gdb port]')
     exit(0)
 
 import gdb_rpc, traces
 
-gdb = gdb_rpc.GDB(sys.argv[2]) if len(sys.argv) == 3 else gdb_rpc.GDB(sys.argv[2], int(sys.argv[3]))
+_gdb_port = 1234
+if len(sys.argv) == 6:
+    _gdb_port = int(sys.argv[5])
+elif 'GDB_PORT' in os.environ:
+    _gdb_port = int(os.environ['GDB_PORT'])
+
+if len(sys.argv) >= 4 and sys.argv[3].isdigit():
+    gdb = gdb_rpc.GDB(sys.argv[2], int(sys.argv[3]), gdb_port=_gdb_port)
+else:
+    gdb = gdb_rpc.GDB(sys.argv[2], gdb_port=_gdb_port)
 
 with open(sys.argv[1]) as file:
     content = file.read().strip()

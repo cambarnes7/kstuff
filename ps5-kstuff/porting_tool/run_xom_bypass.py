@@ -32,8 +32,8 @@ if sys.platform not in ('linux', 'darwin'):
     print('This tool supports Linux and macOS. Use WSL on Windows.')
     sys.exit(1)
 
-if len(sys.argv) not in (3, 4, 5):
-    print('usage: run_xom_bypass.py <database.json> <ps5_ip> [port] [kernel_data_dump]')
+if len(sys.argv) not in (3, 4, 5, 6):
+    print('usage: run_xom_bypass.py <database.json> <ps5_ip> [port] [kernel_data_dump] [gdb_port]')
     sys.exit(1)
 
 # On macOS, check for required cross-compilation tools
@@ -64,14 +64,19 @@ import xom_bypass
 db_path = sys.argv[1]
 ps5_ip = sys.argv[2]
 port = int(sys.argv[3]) if len(sys.argv) >= 4 and sys.argv[3].isdigit() else None
-kdump_path = sys.argv[-1] if len(sys.argv) == 5 else None
+kdump_path = sys.argv[4] if len(sys.argv) >= 5 and not sys.argv[4].isdigit() else None
+_gdb_port = int(os.environ.get('GDB_PORT', '1234'))
+if len(sys.argv) >= 6:
+    _gdb_port = int(sys.argv[5])
+elif len(sys.argv) >= 5 and sys.argv[4].isdigit() and kdump_path is None:
+    _gdb_port = int(sys.argv[4])
 
 # Connect to PS5
 print('[*] connecting to PS5...')
 if port is not None:
-    gdb = gdb_rpc.GDB(ps5_ip, port)
+    gdb = gdb_rpc.GDB(ps5_ip, port, gdb_port=_gdb_port)
 else:
-    gdb = gdb_rpc.GDB(ps5_ip)
+    gdb = gdb_rpc.GDB(ps5_ip, gdb_port=_gdb_port)
 
 # Load offset database
 with open(db_path) as f:
