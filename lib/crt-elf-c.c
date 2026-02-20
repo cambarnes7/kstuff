@@ -14,5 +14,9 @@ uint64_t _start(void* dlsym, int master, int victim, uint64_t pktopts, uint64_t 
 
 void elf_main(struct specter_args* args)
 {
-    *args->retval = _start(args->dlsym, args->rwpair[0], args->rwpair[1], 0, args->kdata_base);
+    int rw0 = args->rwpair ? args->rwpair[0] : -1;
+    int rw1 = args->rwpair ? args->rwpair[1] : -1;
+    uint64_t ret = _start(args->dlsym, rw0, rw1, 0, args->kdata_base);
+    if(args->retval)
+        *args->retval = ret;
 }
