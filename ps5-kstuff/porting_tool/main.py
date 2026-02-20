@@ -25,7 +25,8 @@ import gdb_rpc, traces
 gdb = gdb_rpc.GDB(sys.argv[2]) if len(sys.argv) == 3 else gdb_rpc.GDB(sys.argv[2], int(sys.argv[3]))
 
 with open(sys.argv[1]) as file:
-    symbols = json.load(file)
+    content = file.read().strip()
+    symbols = json.loads(content) if content else {}
 
 available_symbols = set()
 

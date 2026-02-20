@@ -53,7 +53,8 @@ else:
 
 # Load offset database
 with open(sys.argv[1]) as f:
-    symbols = json.load(f)
+    content = f.read().strip()
+    symbols = json.loads(content) if content else {}
 
 # Check required offsets exist
 REQUIRED = [
