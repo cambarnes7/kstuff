@@ -1,7 +1,7 @@
 all: payload.bin payload-gdb.bin
 
 clean:
-	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
+	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin payload-hv.elf payload-hv.bin freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
 
 ../lib/lib-elf-ps5.a:
 	cd ../lib; make
@@ -17,6 +17,9 @@ payload.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o main.c sqlite_tri
 
 payload-gdb.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o main.c sqlite_triggers.c utils.c kelf uelf/uelf
 	gcc -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o $(EXTRA_CFLAGS) -DDEBUG main.c -DPS5KEK ../prosper0gdb/dbg.c sqlite_triggers.c utils.c -o payload-gdb.elf -fPIE -ffreestanding -no-pie -Wl,-z,max-page-size=16384 -Wl,-zcommon-page-size=16384
+
+payload-hv.elf: ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o hv_research.c
+	gcc -O0 -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a ../prosper0gdb/prosper0gdb.o $(EXTRA_CFLAGS) hv_research.c -DPS5KEK ../prosper0gdb/dbg.c -Wl,-gc-sections -o payload-hv.elf -fPIE -ffreestanding -no-pie -Wl,-z,max-page-size=16384 -Wl,-zcommon-page-size=16384
 
 payloa%.bin: payloa%.elf
 	objcopy $< --only-section .text --only-section .data --only-section .bss --only-section .rodata -O binary $@
