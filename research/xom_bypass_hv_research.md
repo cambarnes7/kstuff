@@ -365,6 +365,80 @@ the HV recognizes and what error codes it returns.
 
 ---
 
+## Implementation: xom_bypass.py
+
+**Tool:** `ps5-kstuff/porting_tool/xom_bypass.py`
+**Runner:** `ps5-kstuff/porting_tool/run_xom_bypass.py`
+
+This is the integrated XOM bypass toolkit that implements all five research
+phases in a single tool. It plugs into the same porting_tool infrastructure
+as hv_probe.py — no new payload required.
+
+### Usage
+
+```bash
+# Full run (requires porting_tool offsets + kernel .data cache)
+python3 run_xom_bypass.py database.json <ps5_ip> [port] [kdata_cache.bin]
+
+# Or from Python:
+import xom_bypass
+results = xom_bypass.run_full_bypass(gdb, r0gdb, kdata_base, symbols, kernel_data)
+```
+
+### What it does
+
+**Phase 1: Guest Page Table Dump** (`dump_guest_page_tables`)
+- Walks PML4 → PDPT → PD → PT through DMAP (zero risk)
+- Maps all physical memory regions with flags (R/W/X/NX)
+- Identifies .text physical ranges (XOM-protected) via IDT cross-reference
+- Finds physical address gaps (potential HV-reserved regions)
+
+**Phase 2: Kernel .data Mining** (`scan_kdata_for_hv_artifacts`)
+- Catalogs ALL function pointers from .data → .text
+- Finds consecutive pointer arrays (potential hypercall dispatch tables)
+- Searches for QA flags structure (small flag words near kernel_pmap_store)
+- Finds page-aligned physical addresses (potential VMCB pointers)
+- Scans for HV-related strings
+
+**Phase 3: Instruction Recovery** (`recover_instructions`)
+- Single-step executes .text instructions with controlled register state
+- Deduces instruction semantics from register/memory side effects
+- Targets addresses found in Phase 2 (hypercall table entries)
+
+**Phase 4: MSR Probing** (`probe_msrs`)
+- Reads EFER (SVME bit, potential xotext control in high bits)
+- Probes VM_CR (SVM lock state)
+- Probes VM_HSAVE_PA (HV save area physical address → VMCB location)
+- Enumerates all readable vs MSRPM-protected MSRs
+- Safe: #GP caught by kstuff int13_handler
+
+**Phase 5: Sleep/Resume Attack** (`attempt_sleep_resume_attack`)
+- Locates QA flags candidates from Phase 2
+- Writes debug/QA bits to flag locations
+- Tests if XOM enforcement changes
+- Provides instructions for manual suspend/resume cycle
+
+### Output files
+
+- `xom_full_results.json` — all phase results combined
+- `xom_page_tables.json` — guest physical memory map
+- `xom_data_mining.json` — HV artifact scan results
+- `xom_msr_results.json` — MSR accessibility map
+
+### Key attack vectors detected
+
+The tool analyzes results across all phases and identifies:
+1. **Shared function pointer tables** — if a .data array of .text pointers is
+   used by the HV as a dispatch table, overwriting entries redirects HV execution
+2. **VM_HSAVE_PA leak** — if readable, reveals VMCB physical address; if the VMCB
+   page is DMAP-accessible, NPT entries can be modified to clear xotext
+3. **QA flag persistence** — if QA flags survive sleep/resume without HV
+   reinitialization, XOM can be disabled through the QA interface
+4. **EFER high bits** — custom AMD bits above bit 15 may control xotext; if EFER
+   is writable (or modifiable via VMCB), xotext can be toggled
+
+---
+
 ## What This Won't Give Us (Limitations)
 
 - **HV code disassembly** — we cannot read HV code. We can only observe its external
