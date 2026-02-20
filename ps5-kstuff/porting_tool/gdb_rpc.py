@@ -168,11 +168,22 @@ class GDB:
         assert self.popen == None
         print('Connecting GDB... ', end='')
         sys.stdout.flush()
-        self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
-        with stdio:
-            self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
-        self._read_until(token.encode('ascii')+b'\n')
-        print('done')
+        for attempt in range(5):
+            if attempt > 0:
+                sys.stdout.write('retry %d... ' % attempt)
+                sys.stdout.flush()
+                time.sleep(3)
+            self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
+            with stdio:
+                self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
+            output = self._read_until(token.encode('ascii')+b'\n')
+            if b'could not connect' not in output and b'Connection refused' not in output and b'Connection timed out' not in output and b'Operation timed out' not in output:
+                print('done')
+                return
+            self.popen.kill()
+            self.popen = None
+            self.stdio = None
+        raise DisconnectedException("could not connect GDB to PS5 after 5 attempts")
     def execute(self, cmd, timeout=None):
         if timeout is not None: timeout += time.time()
         assert self.popen != None
