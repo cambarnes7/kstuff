@@ -397,16 +397,9 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     /* DIAGNOSTIC: verify payload entry is reached at all */
     notify("HV: payload started");
 
-    if(r0gdb_init(ds, a, b, c, d))
-    {
-        notify("HV: FW not supported");
-        return 1;
-    }
-
-    notify("HV: r0gdb init OK");
-
+    /* Test sysctl (fw version) BEFORE r0gdb_init to isolate the hang */
+    notify("HV: testing sysctl...");
     uint32_t fw_version = r0gdb_get_fw_version();
-
     {
         char msg[64] = "HV: FW=0x";
         char hex[] = "0123456789abcdef";
@@ -416,6 +409,15 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         *p = 0;
         notify(msg);
     }
+
+    notify("HV: calling r0gdb_init...");
+    if(r0gdb_init(ds, a, b, c, d))
+    {
+        notify("HV: FW not supported");
+        return 1;
+    }
+
+    notify("HV: r0gdb init OK");
 
     notify("HV: connecting to listener...");
 
