@@ -8,7 +8,7 @@ clean:
 	rm -f payload.elf payload.bin r0run.o prosper0gdb.o
 
 ../lib/lib-elf-ps5.a:
-	cd ../lib; $(MAKE)
+	$(MAKE) -C ../lib CROSS_COMPILE=$(CROSS_COMPILE)
 
 r0run.o: r0run.asm
 	yasm -f elf64 -g dwarf2 r0run.asm -o r0run.o

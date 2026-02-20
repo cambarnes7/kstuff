@@ -1,4 +1,5 @@
 CROSS_COMPILE ?=
+export CROSS_COMPILE
 CC = $(CROSS_COMPILE)gcc
 OBJCOPY = $(CROSS_COMPILE)objcopy
 
@@ -8,10 +9,10 @@ clean:
 	rm -f payload.elf payload.bin payload-gdb.elf payload-gdb.bin payload-hv.elf payload-hv.bin freebsd-loader kelf kelf.o structs.h structs.inc uelf/uelf uelf/uelf.bin uelf/crt.o
 
 ../lib/lib-elf-ps5.a:
-	cd ../lib; $(MAKE)
+	$(MAKE) -C ../lib CROSS_COMPILE=$(CROSS_COMPILE)
 
 ../prosper0gdb/prosper0gdb.o:
-	cd ../prosper0gdb; $(MAKE)
+	$(MAKE) -C ../prosper0gdb CROSS_COMPILE=$(CROSS_COMPILE)
 
 structs.inc: structs-ps5.inc
 	cp structs-ps5.inc structs.inc
