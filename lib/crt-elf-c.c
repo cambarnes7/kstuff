@@ -14,9 +14,10 @@ uint64_t _start(void* dlsym, int master, int victim, uint64_t pktopts, uint64_t 
 
 void elf_main(struct specter_args* args)
 {
-    int rw0 = args->rwpair ? args->rwpair[0] : -1;
-    int rw1 = args->rwpair ? args->rwpair[1] : -1;
-    uint64_t ret = _start(args->dlsym, rw0, rw1, 0, args->kdata_base);
+    // Don't pass rwpair/kdata_base - elfldr uses pipe-based kernel RW
+    // which is incompatible with prosper0gdb's pktopts technique.
+    // The GDB stub starts without kernel RW; it can be set up via GDB.
+    uint64_t ret = _start(args->dlsym, -1, -1, 0, 0);
     if(args->retval)
         *args->retval = ret;
 }

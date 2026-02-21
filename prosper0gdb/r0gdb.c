@@ -1614,7 +1614,7 @@ int r0gdb_init(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     victim_fd = b;
     victim_pktopts = c;
     kdata_base = d;
-    if(!set_offsets())
+    if(a >= 0 && b >= 0 && !set_offsets())
     {
         r0gdb_init_with_offsets();
         return 0;
