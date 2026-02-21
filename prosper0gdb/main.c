@@ -133,11 +133,18 @@ void log_deltas(uint64_t pointer)
 extern void* addr____error;
 int dynlib_dlsym(int, const char*, void**);
 
+// Fallback errno for when dynlib_dlsym can't resolve __error
+// (e.g. newer elfldr passes getpid instead of dlsym)
+static int fallback_errno;
+static int* fallback_error(void) { return &fallback_errno; }
+
 int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
 {
-    // Resolve __error early for errno support (p_syscall is pre-set by _start)
+    // Resolve __error for errno support (p_syscall is pre-set by _start)
     if(!addr____error)
         dynlib_dlsym(1, "__error", &addr____error);
+    if(!addr____error)
+        addr____error = (void*)fallback_error;
     r0gdb_init(ds, a, b, c, d);
     dbg_enter();
     return 0; //p r0gdb() for magic
