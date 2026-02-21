@@ -24,7 +24,7 @@ payload-elfldr-dbg.elf: ../lib/lib-elf-ps5.a main.c prosper0gdb.o dbg.c
 	$(CC) -O0 -g -isystem ../freebsd-headers -nostdinc -nostdlib -fno-stack-protector -static ../lib/lib-elf-ps5.a $(EXTRA_CFLAGS) main.c prosper0gdb.o -D__PS4__ -DPS5KEK -DPIE_BUILD dbg.c -o payload-elfldr-dbg.elf -fPIE -ffreestanding -Wl,-pie -Wl,--entry=elf_main -Wl,-gc-sections -Wl,-zmax-page-size=16384 -Wl,-zcommon-page-size=16384
 
 payload-elfldr.elf: payload-elfldr-dbg.elf
-	$(OBJCOPY) --strip-all payload-elfldr-dbg.elf payload-elfldr.elf
+	$(OBJCOPY) --strip-debug payload-elfldr-dbg.elf payload-elfldr.elf
 
 payload.bin: payload.elf
 	$(OBJCOPY) payload.elf --only-section .text --only-section .data --only-section .bss --only-section .rodata -O binary payload.bin
