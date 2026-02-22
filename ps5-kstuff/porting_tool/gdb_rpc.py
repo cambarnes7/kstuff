@@ -178,14 +178,38 @@ class GDB:
             ln = self._read_until(b'\n', tl)
             if ln.startswith(b'[[['):
                 return eval(ln.decode('ascii'))[0][0][0]
+    def wait_for_port(self, port=1234, timeout=15):
+        """Wait for PS5 GDB stub to open a port. Returns True if port opened."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                s = socket.create_connection((self.ps5_ip, port), timeout=2)
+                s.close()
+                return True
+            except socket.error:
+                time.sleep(0.5)
+        return False
     def connect_gdb(self):
         assert self.popen == None
         print('Connecting GDB... ', end='')
         sys.stdout.flush()
         self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
+        self._gdb_stderr = None
+        stderr_r, stderr_w = os.pipe()
         with stdio:
-            self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
-        self._read_until(token.encode('ascii')+b'\n')
+            self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=stderr_w, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
+        os.close(stderr_w)
+        try:
+            self._read_until(token.encode('ascii')+b'\n')
+        except DisconnectedException:
+            # Capture GDB stderr for diagnostics
+            try:
+                self._gdb_stderr = os.read(stderr_r, 4096).decode('utf-8', errors='replace').strip()
+            except OSError:
+                pass
+            os.close(stderr_r)
+            raise
+        os.close(stderr_r)
         print('done')
     def execute(self, cmd, timeout=None):
         if timeout is not None: timeout += time.time()

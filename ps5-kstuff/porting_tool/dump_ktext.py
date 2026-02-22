@@ -52,6 +52,46 @@ def setup_r0gdb():
         gdb.eval('r0gdb_init_with_offsets()')
     return kdata_base
 
+def setup_r0gdb_with_retry(max_retries=2):
+    """Try setup_r0gdb with retries. Probes port 1234 before connecting GDB."""
+    for attempt in range(max_retries + 1):
+        try:
+            return setup_r0gdb()
+        except gdb_rpc.DisconnectedException as e:
+            stderr_msg = getattr(gdb, '_gdb_stderr', None)
+            if attempt < max_retries:
+                print(f'  Attempt {attempt+1} failed: {e}')
+                if stderr_msg:
+                    print(f'  GDB stderr: {stderr_msg}')
+                delay = 2 * (attempt + 1)
+                print(f'  Retrying in {delay}s...')
+                time.sleep(delay)
+            else:
+                # Final attempt failed — provide diagnostics
+                print(f'  Failed to connect: {e}')
+                if stderr_msg:
+                    print(f'  GDB stderr: {stderr_msg}')
+                print()
+                print('  Diagnosing...')
+                port_open = gdb.wait_for_port(1234, timeout=5)
+                if not port_open:
+                    print('  Port 1234 is NOT open on the PS5.')
+                    print('  The payload was sent but the GDB stub never started.')
+                    print()
+                    print('  Possible causes:')
+                    if ps5_port != 9019:
+                        print(f'  - Port {ps5_port} loader may be incompatible with')
+                        print(f'    prosper0gdb payload-elfldr.elf format.')
+                        print(f'    The elfldr payload uses elf_main(struct specter_args*)')
+                        print(f'    but ps5-payload-dev loaders pass payload_args_t*.')
+                        print(f'  - Try using port 9019 (frankenelf format) instead.')
+                    print('  - The payload may have crashed during initialization.')
+                    print('  - The PS5 kernel exploit state may need to be re-triggered.')
+                else:
+                    print('  Port 1234 IS open. GDB failed to connect to it.')
+                    print('  This may be a GDB or network issue.')
+                raise
+
 def get_dmap_and_cr3(kdata_base):
     """Get dmap base and cr3 from kernel_pmap_store."""
     if 'kernel_pmap_store' not in symbols:
@@ -471,7 +511,9 @@ def main():
     # Step 1: Connect
     print('[1/5] Connecting to PS5...')
     try:
-        kdata_base = setup_r0gdb()
+        kdata_base = setup_r0gdb_with_retry()
+    except gdb_rpc.DisconnectedException:
+        return
     except Exception as e:
         print(f'  Failed to connect: {e}')
         return
