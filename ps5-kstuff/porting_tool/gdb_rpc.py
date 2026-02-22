@@ -2,10 +2,21 @@ import subprocess, os, threading, socket, sys, signal, time, functools, shutil
 
 token = os.urandom(16).hex()
 
-rpc_server = '''
-import sys
+def _make_rpc_server(target, tok):
+    return '''
+import sys, time
 sys.stdin = sys.__stdin__
 sys.stdout = sys.__stdout__
+
+_target_ok = False
+for _i in range(20):
+    try:
+        gdb.execute('target remote %s')
+        _target_ok = True
+        break
+    except gdb.error:
+        time.sleep(0.5)
+
 print(%r)
 
 while True:
@@ -16,7 +27,7 @@ while True:
     try: ans = eval(prompt)
     except gdb.error as e: ans = str(e)
     print(repr([[[ans]]]))
-'''%token
+''' % (target, tok)
 
 class DisconnectedException(Exception): pass
 
@@ -196,8 +207,9 @@ class GDB:
         self.stdio, stdio = socket.socketpair(socket.AF_UNIX)
         self._gdb_stderr = None
         stderr_r, stderr_w = os.pipe()
+        script = _make_rpc_server(self.ps5_ip + ':1234', token)
         with stdio:
-            self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 10', '-ex', 'target remote '+self.ps5_ip+':1234', '-ex', 'py\n'+rpc_server+'\nend'), stdin=stdio, stdout=stdio, stderr=stderr_w, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
+            self.popen = subprocess.Popen(('gdb', '../../'+self.payload_path, '-ex', 'set tcp connect-timeout 2', '-ex', 'py\n'+script+'\nend'), stdin=stdio, stdout=stdio, stderr=stderr_w, bufsize=0, preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT]))
         os.close(stderr_w)
         try:
             self._read_until(token.encode('ascii')+b'\n')
@@ -210,6 +222,13 @@ class GDB:
             os.close(stderr_r)
             raise
         os.close(stderr_r)
+        # Verify target remote actually connected
+        self._write(b'_target_ok\n')
+        if self._read_eval() != True:
+            self.popen.kill()
+            self.popen = None
+            self.stdio = None
+            raise DisconnectedException("target remote failed after 10s — GDB stub not reachable on port 1234")
         print('done')
     def execute(self, cmd, timeout=None):
         if timeout is not None: timeout += time.time()
