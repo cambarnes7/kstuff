@@ -39,6 +39,12 @@ class GDB:
         sock.bind((addr, 0))
         sock.listen(1)
         return sock, sock.getsockname()
+    def _payload_path(self, base_bin):
+        """Choose payload format based on loader type.
+        Default port 9019 = frankenelf .bin, other ports = elfldr PIE ELF."""
+        if self.ps5_port != 9019:
+            return base_bin.replace('payload.bin', 'payload-elfldr.elf')
+        return base_bin
     def use_r0gdb(self, flags=[]):
         if self.popen == None or self.payload != 'r0gdb' or self.r0gdb_cflags != flags:
             self.kill()
@@ -47,7 +53,7 @@ class GDB:
                 self.r0gdb_cflags = flags
                 self.kstuff_cflags = None
                 self.self_dumper_flags = None
-            self.send_payload('prosper0gdb/payload.bin')
+            self.send_payload(self._payload_path('prosper0gdb/payload.bin'))
             self.connect_gdb()
             self.payload = 'r0gdb'
             return True
@@ -118,6 +124,8 @@ class GDB:
                     self.payload_path = path
                     if self.payload_path.endswith('.bin'):
                         self.payload_path = self.payload_path[:-4]+'.elf'
+                    elif 'elfldr.elf' in self.payload_path:
+                        self.payload_path = self.payload_path.replace('elfldr.elf', 'elfldr-dbg.elf')
                     return
                 print(' error, retrying')
     def _monitor(self):
