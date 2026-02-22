@@ -178,9 +178,12 @@ class GDB:
                 chk = self.stdio.recv(1)
             except OSError: chk = b''
             if not chk:
+                partial = q.decode('utf-8', errors='replace').strip()
                 self.popen.kill()
                 self.popen = None
                 self.stdio = None
+                if partial:
+                    raise DisconnectedException("read failed; GDB output before death:\n" + partial)
                 raise DisconnectedException("read failed")
             q += chk
         return q
