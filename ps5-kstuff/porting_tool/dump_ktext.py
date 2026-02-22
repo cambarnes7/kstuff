@@ -43,10 +43,108 @@ gdb = gdb_rpc.GDB(ps5_ip, ps5_port)
 def ostr(x):
     return str(x % 2**64)
 
+def discover_kdata_base():
+    """Discover kdata_base at runtime when the loader doesn't provide it.
+
+    Uses sysctl KERN_PROC_PID to get our proc's kernel address, then
+    walks the allproc linked list backward via p_list.le_prev to find
+    the allproc head pointer in kernel .data. kdata_base is then computed
+    from the known allproc offset.
+    """
+    if 'allproc' not in symbols:
+        print('  ERROR: allproc offset required in database to discover kdata_base')
+        return 0
+
+    pid = gdb.ieval('getpid()')
+    print(f'  PID = {pid}, discovering kdata_base via sysctl...')
+
+    # sysctl kern.proc.pid.<pid>:
+    #   mib = {CTL_KERN=1, KERN_PROC=14, KERN_PROC_PID=1, pid}
+    buf = gdb.ieval('malloc(2048)')
+    size_ptr = gdb.ieval('malloc(8)')
+    mib = gdb.ieval('malloc(16)')
+    gdb.ieval('{void*}%d = 2048' % size_ptr)
+    gdb.ieval('{int}%d = 1' % mib)          # CTL_KERN
+    gdb.ieval('{int}%d = 14' % (mib + 4))   # KERN_PROC
+    gdb.ieval('{int}%d = 1' % (mib + 8))    # KERN_PROC_PID
+    gdb.ieval('{int}%d = %d' % (mib + 12, pid))
+
+    ret = gdb.ieval('__sysctl(%d, 4, %d, %d, 0, 0)' % (mib, buf, size_ptr))
+    if ret != 0:
+        print(f'  sysctl KERN_PROC_PID failed (ret={ret})')
+        return 0
+
+    # ki_paddr is at offset 16 in struct kinfo_proc (see freebsd-headers/sys/user.h)
+    our_proc = gdb.ieval('{void*}%d' % (buf + 16))
+    print(f'  our proc = {hex(our_proc)}')
+
+    if our_proc == 0 or our_proc < 0xffffffff00000000:
+        print(f'  ERROR: invalid proc address')
+        return 0
+
+    # Verify by checking p_pid at offset 0xbc
+    pid_check = gdb.ieval('kread8(%s)' % ostr(our_proc + 0xb8)) & 0xFFFFFFFF
+    if pid_check != pid:
+        print(f'  WARNING: proc->p_pid = {pid_check}, expected {pid}')
+
+    # Walk backward through p_list.le_prev to find allproc
+    # struct proc: offset 0 = le_next, offset 8 = le_prev
+    # le_prev points to the le_next field that references this proc
+    # For the first proc, le_prev = &allproc.lh_first
+    proc = our_proc
+    steps = 0
+    max_steps = 500  # safety limit
+    while steps < max_steps:
+        le_prev = gdb.ieval('kread8(%s)' % ostr(proc + 8))
+        if le_prev == 0 or le_prev < 0xffffffff00000000:
+            print(f'  ERROR: invalid le_prev at step {steps}')
+            return 0
+
+        # Check if le_prev points to another proc's le_next
+        # If so, *le_prev == proc, and le_prev is that proc's address
+        check_val = gdb.ieval('kread8(%s)' % ostr(le_prev))
+        if check_val != proc:
+            print(f'  ERROR: le_prev chain broken at step {steps}')
+            return 0
+
+        # Is le_prev the address of allproc? Or the address of prev proc?
+        # If prev proc: (le_prev + 8) is its le_prev, and *(*(le_prev+8)) == le_prev
+        if steps < max_steps - 1:
+            prev_le_prev = gdb.ieval('kread8(%s)' % ostr(le_prev + 8))
+            if prev_le_prev != 0 and prev_le_prev >= 0xffffffff00000000:
+                prev_check = gdb.ieval('kread8(%s)' % ostr(prev_le_prev))
+                if prev_check == le_prev:
+                    # le_prev is a proc struct, continue walking
+                    proc = le_prev
+                    steps += 1
+                    continue
+
+            # le_prev is likely allproc (not a proc struct)
+            allproc_addr = le_prev
+            kdata_base = (allproc_addr - symbols['allproc']) % (2**64)
+            print(f'  allproc @ {hex(allproc_addr)} (walked {steps + 1} procs)')
+            print(f'  kdata_base = {hex(kdata_base)}')
+            return kdata_base
+
+        steps += 1
+
+    print(f'  ERROR: walked {max_steps} procs without finding allproc')
+    return 0
+
 def setup_r0gdb():
     """Initialize r0gdb connection and return kdata_base."""
     gdb.use_r0gdb(R0GDB_FLAGS)
     kdata_base = gdb.ieval('kdata_base')
+
+    if kdata_base == 0:
+        print('  kdata_base = 0 (loader did not provide it), discovering...')
+        kdata_base = discover_kdata_base()
+        if kdata_base == 0:
+            print('  FATAL: cannot determine kdata_base')
+            return 0
+        # Store back so the payload has it
+        gdb.ieval('kdata_base = %s' % ostr(kdata_base))
+
     gdb.eval('offsets.allproc = ' + ostr(kdata_base + symbols['allproc']))
     if not gdb.ieval('rpipe'):
         gdb.eval('r0gdb_init_with_offsets()')
@@ -92,11 +190,79 @@ def setup_r0gdb_with_retry(max_retries=2):
                     print('  This may be a GDB or network issue.')
                 raise
 
+def discover_kernel_pmap_store(kdata_base):
+    """Discover kernel_pmap_store offset using FW version lookup + verification.
+
+    Uses a table of known offsets per firmware version extracted from offsets.c.
+    Falls back to scanning a small range of candidates if the exact FW isn't known.
+    """
+    # Known kernel_pmap_store offsets per firmware version (from prosper0gdb/offsets.c)
+    kps_table = {
+        0x300: 0x31be218, 0x310: 0x31be218, 0x320: 0x31be218, 0x321: 0x31be218,
+        0x400: 0x3257a78, 0x402: 0x3257a78, 0x403: 0x3257a78,
+        0x450: 0x3257a78, 0x451: 0x3257a78,
+        0x500: 0x3398a88, 0x502: 0x3398a88, 0x510: 0x3398a88,
+        0x550: 0x3394a88,
+        0x600: 0x32e4358, 0x602: 0x32e4358, 0x650: 0x32e4358,
+        0x700: 0x2E2C848, 0x701: 0x2E2C848, 0x720: 0x2E2C848,
+        0x740: 0x2E2C848, 0x760: 0x2E2C848, 0x761: 0x2E2C848,
+        0x800: 0x2e48848, 0x820: 0x2e48848, 0x840: 0x2e48848, 0x860: 0x2e48848,
+        0x900: 0x2d28b78, 0x905: 0x2d28b78, 0x920: 0x2d28b78,
+        0x940: 0x2d28b78, 0x960: 0x2d28b78,
+        0x1000: 0x2cf0ef8, 0x1001: 0x2cf0ef8,
+    }
+
+    print('  kernel_pmap_store not in database, looking up by FW version...')
+    fw_ver = gdb.ieval('r0gdb_get_fw_version()') >> 16
+    print(f'  FW version: {fw_ver:#x}')
+
+    # Build list of candidate offsets to try
+    candidates = []
+    if fw_ver in kps_table:
+        candidates.append(kps_table[fw_ver])
+    # Also try nearby FW versions' offsets (unique values only)
+    seen = set(candidates)
+    for ver, off in sorted(kps_table.items()):
+        if off not in seen:
+            candidates.append(off)
+            seen.add(off)
+
+    def verify_kps(offset):
+        """Verify a kernel_pmap_store candidate by checking its fields."""
+        addr = kdata_base + offset
+        # kernel_pmap_store+8 = pm_type, should be 0x1430000
+        pm_type = gdb.ieval('kread8(%s)' % ostr(addr + 8))
+        if pm_type != 0x1430000:
+            return False
+        # +32 = pm_pml4 (kernel VA), +40 = pm_pml4pa (physical addr)
+        pm_pml4 = gdb.ieval('kread8(%s)' % ostr(addr + 32))
+        pm_pml4pa = gdb.ieval('kread8(%s)' % ostr(addr + 40))
+        if pm_pml4 < 0xffff800000000000 or pm_pml4pa == 0 or pm_pml4pa > 0x800000000:
+            return False
+        # dmap sanity: pm_pml4 - pm_pml4pa should be a reasonable dmap base
+        dmap = (pm_pml4 - pm_pml4pa) % (2**64)
+        if dmap < 0xffff800000000000:
+            return False
+        return True
+
+    for offset in candidates:
+        try:
+            if verify_kps(offset):
+                print(f'  Found kernel_pmap_store at offset {hex(offset)}')
+                symbols['kernel_pmap_store'] = offset
+                return offset
+        except Exception:
+            continue
+
+    print('  ERROR: could not find kernel_pmap_store for this firmware')
+    return None
+
 def get_dmap_and_cr3(kdata_base):
     """Get dmap base and cr3 from kernel_pmap_store."""
     if 'kernel_pmap_store' not in symbols:
-        print('  ERROR: kernel_pmap_store not in database')
-        return None, None
+        kps_offset = discover_kernel_pmap_store(kdata_base)
+        if kps_offset is None:
+            return None, None
     kps = kdata_base + symbols['kernel_pmap_store']
     # kernel_pmap_store+32 = pm_pml4 (VA), +40 = pm_pml4pa (PA)
     pm_pml4 = gdb.ieval('{void*}%d' % (kps + 32))
@@ -516,6 +682,9 @@ def main():
         return
     except Exception as e:
         print(f'  Failed to connect: {e}')
+        return
+    if kdata_base == 0:
+        print('  FATAL: kdata_base could not be determined')
         return
     print(f'  kdata_base = {hex(kdata_base)}')
 
