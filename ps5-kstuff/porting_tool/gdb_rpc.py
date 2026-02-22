@@ -1,4 +1,4 @@
-import subprocess, os, threading, socket, sys, signal, time, functools
+import subprocess, os, threading, socket, sys, signal, time, functools, shutil
 
 token = os.urandom(16).hex()
 
@@ -85,7 +85,14 @@ class GDB:
             return True
         return False
     def build(self, payload, flags):
-        assert not subprocess.call(('make', 'EXTRA_CFLAGS='+' '.join(flags), 'clean', 'all'), cwd='../../'+payload)
+        env = dict(os.environ)
+        # Auto-detect x86_64 cross-compiler on macOS
+        if sys.platform == 'darwin' or not shutil.which('x86_64-elf-gcc') is None:
+            for tool, var in [('gcc', 'CC'), ('ld', 'LD'), ('objcopy', 'OBJCOPY')]:
+                cross = 'x86_64-elf-' + tool
+                if shutil.which(cross):
+                    env[var] = cross
+        assert not subprocess.call(('make', 'EXTRA_CFLAGS='+' '.join(flags), 'clean', 'all'), cwd='../../'+payload, env=env)
     def send_payload(self, path):
         with open('../../'+path, 'rb') as file:
             data = memoryview(file.read())
